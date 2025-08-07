@@ -1,6 +1,5 @@
 // index.js
 const express = require('express');
-const fetch = require('node-fetch');
 const cors = require('cors');
 
 const app = express();
@@ -18,7 +17,10 @@ if (!WEBFLOW_API_KEY || !WEBFLOW_SITE_ID) {
 app.use(cors());
 app.use(express.json());
 
-// ✅ MCP-compliant SSE endpoint
+/**
+ * ✅ MCP-compliant SSE endpoint
+ * Sends an immediate handshake packet for ChatGPT MCP connector validation
+ */
 app.get('/sse', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -38,7 +40,10 @@ app.get('/sse', (req, res) => {
 
   // Heartbeat every 30 seconds
   const interval = setInterval(() => {
-    res.write(`data: ${JSON.stringify({ type: "heartbeat", timestamp: new Date().toISOString() })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      type: "heartbeat",
+      timestamp: new Date().toISOString()
+    })}\n\n`);
   }, 30000);
 
   req.on('close', () => {
