@@ -20,8 +20,14 @@ app.use(express.json());
 /**
  * ✅ MCP-compliant SSE endpoint
  * Sends an immediate handshake packet for ChatGPT MCP connector validation
+ * Includes debug logging for connection attempts
  */
 app.get('/sse', (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const userAgent = req.headers['user-agent'] || 'Unknown UA';
+
+  console.log(`📥 [SSE] Incoming connection from ${ip} | UA: ${userAgent} | ${new Date().toISOString()}`);
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -30,24 +36,27 @@ app.get('/sse', (req, res) => {
   });
 
   // Immediate handshake
-  res.write(`data: ${JSON.stringify({
+  const handshake = {
     type: "connection",
     status: "active",
     message: "Webflow MCP Connector is live",
     timestamp: new Date().toISOString(),
     capabilities: { collections: true, items: true, crud: true }
-  })}\n\n`);
+  };
+
+  console.log(`📡 [SSE] Sent handshake: ${JSON.stringify(handshake)}`);
+  res.write(`data: ${JSON.stringify(handshake)}\n\n`);
 
   // Heartbeat every 30 seconds
   const interval = setInterval(() => {
-    res.write(`data: ${JSON.stringify({
-      type: "heartbeat",
-      timestamp: new Date().toISOString()
-    })}\n\n`);
+    const hb = { type: "heartbeat", timestamp: new Date().toISOString() };
+    res.write(`data: ${JSON.stringify(hb)}\n\n`);
+    console.log(`💓 [SSE] Heartbeat sent at ${hb.timestamp}`);
   }, 30000);
 
   req.on('close', () => {
     clearInterval(interval);
+    console.log(`❌ [SSE] Connection closed from ${ip} at ${new Date().toISOString()}`);
     res.end();
   });
 });
