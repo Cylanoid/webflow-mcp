@@ -1,4 +1,5 @@
 # Webflow MCP Connector
+# Trigger redeploy
 
 A Node.js/Express server that bridges OpenAI's MCP (Model Context Protocol) with Webflow's CMS API, enabling ChatGPT to manage your Webflow site content.
 
