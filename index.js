@@ -9,7 +9,8 @@
  *    * full=true: enable site-level inventory with v2 endpoints
  * - Items CRUD, publish
  * - Clean JSON errors
- * - NEW: Webflow API version auto-fallback (1.1.0 → 1.0.0 on UnsupportedVersion)
+ * - Auto Webflow version fallback: 1.1.0 → 1.0.0 on UnsupportedVersion
+ * - Auto payload fallback for items: fieldData → fields when v1 requires it
  */
 
 const express = require('express');
@@ -123,23 +124,31 @@ const resolveCollectionId = (idOrAlias) => {
   return idOrAlias;
 };
 
-function normalizeItemPayload(input) {
-  const source = input || {};
-  let fieldData = {};
-  if (source.fieldData && typeof source.fieldData === 'object') {
-    fieldData = { ...source.fieldData };
-  } else {
-    for (const [k, v] of Object.entries(source)) {
-      if (k !== 'fieldData') fieldData[k] = v;
-    }
+function toFieldDataShape(body) {
+  const src = body || {};
+  if (src.fieldData && typeof src.fieldData === 'object') {
+    return { ...src.fieldData };
   }
-  if (source._draft !== undefined) fieldData._draft = !!source._draft;
-  if (source._archived !== undefined) fieldData._archived = !!source._archived;
-  if (source.isDraft !== undefined) fieldData._draft = !!source.isDraft;
-  if (source.isArchived !== undefined) fieldData._archived = !!source.isArchived;
-  if (fieldData._draft === undefined) fieldData._draft = false;
-  if (fieldData._archived === undefined) fieldData._archived = false;
-  return { fieldData };
+  const fd = {};
+  for (const [k, v] of Object.entries(src)) {
+    if (k !== 'fieldData') fd[k] = v;
+  }
+  return fd;
+}
+
+function normalizeDraftArchive(fd, src) {
+  const out = { ...fd };
+  if (out._draft === undefined) {
+    if (src?.isDraft !== undefined) out._draft = !!src.isDraft;
+    else if (src?._draft !== undefined) out._draft = !!src._draft;
+    else out._draft = false;
+  }
+  if (out._archived === undefined) {
+    if (src?.isArchived !== undefined) out._archived = !!src.isArchived;
+    else if (src?._archived !== undefined) out._archived = !!src._archived;
+    else out._archived = false;
+  }
+  return out;
 }
 
 async function listAllItems(collectionId, pageSize = 100) {
@@ -229,7 +238,7 @@ app.get('/collections/:idOrAlias', asyncHandler(async (req, res) => {
   res.json({ status: 'ok', collection: data });
 }));
 
-// Items
+// ---- Items LIST/GET ----
 app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { all, limit, offset } = req.query;
@@ -250,27 +259,53 @@ app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) =
   res.json({ status: 'ok', collectionId, item });
 }));
 
+// ---- Items CREATE (with fieldData→fields fallback) ----
 app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const payload = normalizeItemPayload(req.body || {});
-  const created = await wf('POST', `/collections/${collectionId}/items`, { body: payload });
-  res.status(201).json({ status: 'ok', collectionId, created });
+  const body = req.body || {};
+  let fieldData = toFieldDataShape(body);
+  fieldData = normalizeDraftArchive(fieldData, body);
+
+  try {
+    const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fieldData } });
+    return res.status(201).json({ status: 'ok', collectionId, created });
+  } catch (e) {
+    const msg = e?.details?.data?.msg || e.message || '';
+    const needFields = e.status === 400 && (/\'fields\' is required/i.test(msg) || /fields is required/i.test(msg));
+    if (!needFields) throw e;
+    const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fields: fieldData } });
+    return res.status(201).json({ status: 'ok', collectionId, created, note: 'v1 fields payload' });
+  }
 }));
 
+// ---- Items UPDATE (with fieldData→fields fallback) ----
 app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const payload = normalizeItemPayload(req.body || {});
-  const updated = await wf('PATCH', `/collections/${collectionId}/items/${req.params.itemId}`, { body: payload });
-  res.json({ status: 'ok', collectionId, itemId: req.params.itemId, updated });
+  const itemId = req.params.itemId;
+  const body = req.body || {};
+  let fieldData = toFieldDataShape(body);
+  fieldData = normalizeDraftArchive(fieldData, body);
+
+  try {
+    const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fieldData } });
+    return res.json({ status: 'ok', collectionId, itemId, updated });
+  } catch (e) {
+    const msg = e?.details?.data?.msg || e.message || '';
+    const needFields = e.status === 400 && (/\'fields\' is required/i.test(msg) || /fields is required/i.test(msg));
+    if (!needFields) throw e;
+    const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fields: fieldData } });
+    return res.json({ status: 'ok', collectionId, itemId, updated, note: 'v1 fields payload' });
+  }
 }));
 
+// ---- Items DELETE ----
 app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const deleted = await wf('DELETE', `/collections/${collectionId}/items/${req.params.itemId}`);
   res.json({ status: 'ok', collectionId, itemId: req.params.itemId, deleted });
 }));
 
-// Publish
+// ---- Items PUBLISH ----
 app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { itemIds = [], siteId } = req.body || {};
@@ -290,7 +325,7 @@ app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) 
   }
 }));
 
-// Aliases
+// ---- Aliases ----
 function aliasRoutes(alias, collectionId) {
   if (!collectionId) return;
   const forward = (method, path) =>
@@ -352,7 +387,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
 
     report.totals.items += items.length;
 
-    // Basic checks (names/slugs/dups)
+    // Basic checks
     const seenSlugs = new Map();
     const missingSlugs = [];
     const missingNames = [];
