@@ -9,6 +9,7 @@
  *    * full=true: enable site-level inventory with v2 endpoints
  * - Items CRUD, publish
  * - Clean JSON errors
+ * - NEW: Webflow API version auto-fallback (1.1.0 → 1.0.0 on UnsupportedVersion)
  */
 
 const express = require('express');
@@ -31,8 +32,9 @@ const {
 
 const SERVICE_NAME = 'webflow-mcp';
 const WF_API_BASE = 'https://api.webflow.com';
-const WF_ACCEPT_VERSION = '1.1.0'; // v2-capable
-console.log(`[${SERVICE_NAME}] Using Webflow API version: ${WF_ACCEPT_VERSION}`);
+const WF_VERSION_PRIMARY = '1.1.0'; // v2-capable (/sites ...)
+const WF_VERSION_LEGACY  = '1.0.0'; // v1-only (/collections/{id}/items ...)
+console.log(`[${SERVICE_NAME}] Webflow API primary: ${WF_VERSION_PRIMARY}, legacy: ${WF_VERSION_LEGACY}`);
 
 // ---- Utilities ----
 class HttpError extends Error {
@@ -65,8 +67,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Webflow HTTP client ----
-async function wf(method, path, { query, body } = {}) {
+// ---- Webflow HTTP client with auto-fallback ----
+async function wfOnce(method, path, version, { query, body } = {}) {
   if (!WEBFLOW_API_KEY) throw new HttpError(500, 'WEBFLOW_API_KEY is not configured');
 
   const url = new URL(WF_API_BASE + path);
@@ -80,7 +82,7 @@ async function wf(method, path, { query, body } = {}) {
     method,
     headers: {
       'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
-      'accept-version': WF_ACCEPT_VERSION,
+      'accept-version': version,
       'Content-Type': 'application/json',
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -92,9 +94,24 @@ async function wf(method, path, { query, body } = {}) {
 
   if (!res.ok) {
     const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
-    throw new HttpError(res.status, msg, { path, data, status: res.status });
+    throw new HttpError(res.status, msg, { path, data, status: res.status, versionUsed: version });
   }
   return data;
+}
+
+async function wf(method, path, opts = {}) {
+  try {
+    return await wfOnce(method, path, WF_VERSION_PRIMARY, opts);
+  } catch (e) {
+    const name = e?.details?.data?.name || '';
+    const msg  = e?.details?.data?.msg  || e.message || '';
+    const isUnsupported = e.status === 400 && (name === 'UnsupportedVersion' || /UnsupportedVersion|Valid ranges include:\s*1\.0\.0/i.test(msg));
+    if (isUnsupported) {
+      // Retry once with legacy 1.0.0 for v1-only endpoints
+      return await wfOnce(method, path, WF_VERSION_LEGACY, opts);
+    }
+    throw e;
+  }
 }
 
 // ---- Helpers ----
@@ -140,7 +157,7 @@ async function listAllItems(collectionId, pageSize = 100) {
   return items;
 }
 
-// v2 site listing (used only when full=true)
+// v2 site listing (only when full=true)
 async function listCollectionsForSite(siteId) {
   try {
     const resp = await wf('GET', `/sites/${siteId}/collections`);
@@ -194,13 +211,12 @@ app.get('/collections', asyncHandler(async (req, res) => {
 
   // SAFE mode: env-only collections
   const ids = [ARTICLES_COLLECTION_ID, RESOURCES_COLLECTION_ID].filter(Boolean);
-  // Try to fetch minimal metadata for each; if any call fails, still return the IDs
   const results = await Promise.all(ids.map(async (id) => {
     try {
       const c = await wf('GET', `/collections/${id}`);
       return { id, name: c?.name || c?.displayName || 'Unknown', slug: c?.slug, ok: true };
-    } catch {
-      return { id, name: 'Unknown (env)', ok: false };
+    } catch (e) {
+      return { id, name: 'Unknown (env)', ok: false, error: { status: e.status || 500, message: e.message } };
     }
   }));
   res.json({ status: 'ok', mode: 'safe', count: results.length, collections: results });
@@ -320,7 +336,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
         .concat(RESOURCES_COLLECTION_ID ? [{ id: RESOURCES_COLLECTION_ID, name: 'Resources (env)' }] : []);
     }
   } catch (e) {
-    report.collectionsFetchError = { status: e.status || 500, message: e.message };
+    report.collectionsFetchError = { status: e.status || 500, message: e.message, details: e.details };
   }
 
   report.totals.collections = collections.length;
@@ -330,10 +346,13 @@ app.get('/audit', asyncHandler(async (req, res) => {
     const cname = c.name || c.displayName || c.slug || cid;
     let items = [];
     let colError = null;
-    try { items = await listAllItems(cid); } catch (e) { colError = { status: e.status || 500, message: e.message }; }
+
+    try { items = await listAllItems(cid); }
+    catch (e) { colError = { status: e.status || 500, message: e.message }; }
 
     report.totals.items += items.length;
 
+    // Basic checks (names/slugs/dups)
     const seenSlugs = new Map();
     const missingSlugs = [];
     const missingNames = [];
@@ -399,28 +418,43 @@ app.get('/audit', asyncHandler(async (req, res) => {
     });
   }
 
+  // Smoke test (create → update → optional publish → delete)
   if (doSmoke) {
     const smoke = { startedAt: new Date().toISOString() };
     const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
     smoke.collectionId = targetCid;
+
     try {
       if (!targetCid) throw new HttpError(400, 'No collection id available for smoke test');
+
       const ts = Date.now();
       const slug = `mcp-smoke-${ts}`;
       const name = `MCP Smoke Test ${ts}`;
-      const created = await wf('POST', `/collections/${targetCid}/items`, { body: { fieldData: { name, slug, _draft: true, _archived: false } } });
-      const createdItemId = created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
+
+      const created = await wf('POST', `/collections/${targetCid}/items`, {
+        body: { fieldData: { name, slug, _draft: true, _archived: false } }
+      });
+      const createdItemId =
+        created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
+
       smoke.created = { ok: true, itemId: createdItemId };
-      await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, { body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } } });
+
+      await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
+        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } }
+      });
       smoke.updated = { ok: true };
+
       if (publish) {
         try {
-          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, { body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined } });
+          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, {
+            body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
+          });
           smoke.published = { ok: true, data: pub };
         } catch (e) {
           smoke.published = { ok: false, status: e.status || 500, message: e.message };
         }
       }
+
       await wf('DELETE', `/collections/${targetCid}/items/${createdItemId}`);
       smoke.deleted = { ok: true };
       smoke.ok = true;
@@ -428,6 +462,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
       smoke.ok = false;
       smoke.error = { status: e.status || 500, message: e.message, details: e.details };
     }
+
     report.smokeTest = smoke;
   }
 
