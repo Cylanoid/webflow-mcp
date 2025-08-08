@@ -5,10 +5,10 @@
  * - Auth gate via x-api-token (CONNECTOR_API_TOKEN)
  * - Health, SSE (/sse)
  * - Collections (safe mode by env; full=true for site inventory)
- * - Items CRUD (fieldData), publish (publishTo)
+ * - Items CRUD (fieldData passed directly), publish (publishTo)
  * - Clean JSON errors
  * - No Accept-Version; base URL is /v2; Content-Type only when body exists
- * - New: Full Data API pass-through, form-data support, mutation guards, scope check
+ * - Full Data API pass-through, form-data support, mutation guards, scope check
  */
 
 const express = require('express');
@@ -75,26 +75,20 @@ async function wf(method, path, { query, body } = {}) {
       if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
     }
   }
-
-  // Detect FormData; when present do NOT set Content-Type manually (boundary is auto-generated)
   const isForm = (typeof FormData !== 'undefined') && (body instanceof FormData);
-
   const headers = {
     'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
     'User-Agent': 'webflow-mcp/2.x',
   };
   if (body && !isForm) headers['Content-Type'] = 'application/json';
-
   const res = await fetch(url, {
     method,
     headers,
     body: body ? (isForm ? body : JSON.stringify(body)) : undefined
   });
-
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-
   if (!res.ok) {
     const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
     console.error(`[${SERVICE_NAME}] WF error: ${msg}`, { path, status: res.status });
@@ -111,25 +105,6 @@ const resolveCollectionId = (idOrAlias) => {
   if (low === 'resources') return RESOURCES_COLLECTION_ID;
   return idOrAlias;
 };
-
-function toFieldDataShape(body) {
-  const src = body || {};
-  if (src.fieldData && typeof src.fieldData === 'object') return { ...src.fieldData };
-  const fd = {};
-  for (const [k, v] of Object.entries(src)) if (k !== 'fieldData') fd[k] = v;
-  return fd;
-}
-
-function normalizeDraftArchive(fd, src) {
-  const out = { ...fd };
-  if (out._draft === undefined) {
-    out._draft = src?.isDraft !== undefined ? !!src.isDraft : (src?._draft !== undefined ? !!src._draft : false);
-  }
-  if (out._archived === undefined) {
-    out._archived = src?.isArchived !== undefined ? !!src.isArchived : (src?._archived !== undefined ? !!src._archived : false);
-  }
-  return out;
-}
 
 async function listAllItems(collectionId, pageSize = 100) {
   const items = [];
@@ -199,8 +174,6 @@ app.get('/collections', asyncHandler(async (req, res) => {
     const collections = await listCollectionsForSite(siteId);
     return res.json({ status: 'ok', mode: 'full', siteId, count: collections.length, collections });
   }
-
-  // Safe mode: just the env-mapped collections
   const ids = [ARTICLES_COLLECTION_ID, RESOURCES_COLLECTION_ID].filter(Boolean);
   const results = await Promise.all(ids.map(async (id) => {
     try {
@@ -242,30 +215,22 @@ app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) =
   res.json({ status: 'ok', collectionId, item });
 }));
 
-// Item create (v2: fieldData)
+// Item create (pass payload directly)
 app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const body = req.body || {};
-  let fieldData = toFieldDataShape(body);
-  fieldData = normalizeDraftArchive(fieldData, body);
-  const created = await wf('POST', `/collections/${collectionId}/items`, {
-    body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived }
-  });
+  const payload = req.body || {};
+  const created = await wf('POST', `/collections/${collectionId}/items`, { body: payload });
   res.status(201).json({ status: 'ok', collectionId, created });
 }));
 
-// Item update (v2: fieldData)
+// Item update (pass payload directly)
 app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const itemId = req.params.itemId;
-  const body = req.body || {};
-  let fieldData = toFieldDataShape(body);
-  fieldData = normalizeDraftArchive(fieldData, body);
-  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, {
-    body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived }
-  });
+  const payload = req.body || {};
+  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: payload });
   res.json({ status: 'ok', collectionId, itemId, updated });
 }));
 
@@ -277,7 +242,7 @@ app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res
   res.json({ status: 'ok', collectionId, itemId: req.params.itemId, deleted });
 }));
 
-// Publish (v2) — correct path: /items/publish
+// Publish (v2)
 app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
@@ -290,7 +255,7 @@ app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) 
   res.json({ status: 'ok', collectionId, published });
 }));
 
-// Aliases (restored)
+// Aliases
 function aliasRoutes(alias, collectionId) {
   if (!collectionId) return;
   const forward = (method, path) =>
@@ -308,7 +273,7 @@ function aliasRoutes(alias, collectionId) {
 aliasRoutes('articles', ARTICLES_COLLECTION_ID);
 aliasRoutes('resources', RESOURCES_COLLECTION_ID);
 
-// Audit (env safe mode by default; full=true for site)
+// Audit
 app.get('/audit', asyncHandler(async (req, res) => {
   const full = (req.query.full === 'true');
   const siteId = req.query.siteId || WEBFLOW_SITE_ID;
@@ -419,9 +384,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
 
   // Smoke test (create → update → optional publish → delete)
   if (doSmoke) {
-    // Require mutation approval for the smoke sequence
     assertMutationAllowed(req);
-
     const smoke = { startedAt: new Date().toISOString() };
     const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
     smoke.collectionId = targetCid;
@@ -483,7 +446,10 @@ for (const base of PASSTHRU_BASES) {
   const handler = asyncHandler(async (req, res) => {
     assertMutationAllowed(req);
     const suffix = req.params[0] ? `/${req.params[0]}` : '';
-    const data = await wf(req.method, `/${base}${suffix}`, { query: req.query, body: (req.body && Object.keys(req.body).length) ? req.body : undefined });
+    const data = await wf(req.method, `/${base}${suffix}`, {
+      query: req.query,
+      body: (req.body && Object.keys(req.body).length) ? req.body : undefined
+    });
     res.json({ status: 'ok', base, data });
   });
   app.all(`/${base}`, handler);
@@ -496,13 +462,11 @@ app.post('/assets/upload-base64', asyncHandler(async (req, res) => {
   const { siteId = WEBFLOW_SITE_ID, folderId, fileName, fileBase64 } = req.body || {};
   if (!siteId) throw new HttpError(400, 'siteId required');
   if (!fileName || !fileBase64) throw new HttpError(400, 'fileName and fileBase64 required');
-
   const buf = Buffer.from(fileBase64, 'base64');
   const form = new FormData();
   const blob = new Blob([buf]);
   form.append('file', blob, fileName);
   if (folderId) form.append('folderId', folderId);
-
   const data = await wf('POST', `/sites/${siteId}/assets`, { body: form });
   res.status(201).json({ status: 'ok', asset: data });
 }));
