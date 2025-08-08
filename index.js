@@ -1,20 +1,20 @@
 'use strict';
 
 /**
- * Webflow MCP Connector – SAFE MODE by default
- * - Auth gate: requires x-api-token if CONNECTOR_API_TOKEN is set
+ * Webflow MCP Connector — v2-only (expanded for full Data API)
+ * - Auth gate via x-api-token (CONNECTOR_API_TOKEN)
  * - Health, SSE (/sse)
- * - Collections & Audit:
- *    * Default SAFE mode: use only env-mapped collections (no /sites calls)
- *    * full=true: enable site-level inventory with v2 endpoints
- * - Items CRUD, publish
+ * - Collections (safe mode by env; full=true for site inventory)
+ * - Items CRUD (fieldData), publish (publishTo)
  * - Clean JSON errors
- * - Auto Webflow version fallback: 1.1.0 → 1.0.0 on UnsupportedVersion
- * - Auto payload fallback for items: fieldData → fields when v1 requires it
+ * - No Accept-Version; base URL is /v2; Content-Type only when body exists
+ * - New: Routes for Sites, Pages, Components, Forms, Custom Code, Assets, Users, Ecommerce, Webhooks, etc.
  */
 
 const express = require('express');
 const crypto = require('crypto');
+const FormData = require('form-data');
+const fetch = require('node-fetch'); // From package.json dependencies
 
 const app = express();
 app.disable('x-powered-by');
@@ -32,10 +32,8 @@ const {
 } = process.env;
 
 const SERVICE_NAME = 'webflow-mcp';
-const WF_API_BASE = 'https://api.webflow.com';
-const WF_VERSION_PRIMARY = '1.1.0'; // v2-capable (/sites ...)
-const WF_VERSION_LEGACY  = '1.0.0'; // v1-only (/collections/{id}/items ...)
-console.log(`[${SERVICE_NAME}] Webflow API primary: ${WF_VERSION_PRIMARY}, legacy: ${WF_VERSION_LEGACY}`);
+const WF_API_BASE = 'https://api.webflow.com/v2';
+console.log(`[${SERVICE_NAME}] Using Webflow v2 API base: ${WF_API_BASE}`);
 
 // ---- Utilities ----
 class HttpError extends Error {
@@ -55,7 +53,7 @@ const safeCompare = (a, b) => {
   return crypto.timingSafeEqual(ab, bb);
 };
 
-// ---- Gate: 401 if CONNECTOR_API_TOKEN set ----
+// ---- Gate: 401 if CONNECTOR_API_TOKEN is set ----
 app.use((req, res, next) => {
   const expected = CONNECTOR_API_TOKEN;
   if (expected && !safeCompare(req.header('x-api-token') || '', expected)) {
@@ -68,50 +66,52 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Webflow HTTP client with auto-fallback ----
-async function wfOnce(method, path, version, { query, body } = {}) {
+// ---- HTTP client (v2 JSON) ----
+async function wf(method, path, { query, body } = {}) {
   if (!WEBFLOW_API_KEY) throw new HttpError(500, 'WEBFLOW_API_KEY is not configured');
-
   const url = new URL(WF_API_BASE + path);
   if (query && typeof query === 'object') {
     for (const [k, v] of Object.entries(query)) {
       if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
     }
   }
+  const headers = {
+    'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
+    'User-Agent': 'webflow-mcp/2.x',
+  };
+  if (body) headers['Content-Type'] = 'application/json';
 
-  const res = await fetch(url, {
-    method,
-    headers: {
-      'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
-      'accept-version': version,
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
   if (!res.ok) {
     const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
-    throw new HttpError(res.status, msg, { path, data, status: res.status, versionUsed: version });
+    throw new HttpError(res.status, msg, { path, data, status: res.status });
   }
   return data;
 }
 
-async function wf(method, path, opts = {}) {
-  try {
-    return await wfOnce(method, path, WF_VERSION_PRIMARY, opts);
-  } catch (e) {
-    const name = e?.details?.data?.name || '';
-    const msg  = e?.details?.data?.msg  || e.message || '';
-    const isUnsupported = e.status === 400 && (name === 'UnsupportedVersion' || /UnsupportedVersion|Valid ranges include:\s*1\.0\.0/i.test(msg));
-    if (isUnsupported) {
-      return await wfOnce(method, path, WF_VERSION_LEGACY, opts);
-    }
-    throw e;
+// ---- HTTP client for multipart (e.g., asset uploads) ----
+async function wfMultipart(method, path, form) {
+  if (!WEBFLOW_API_KEY) throw new HttpError(500, 'WEBFLOW_API_KEY is not configured');
+  const url = WF_API_BASE + path;
+  const headers = {
+    'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
+    'User-Agent': 'webflow-mcp/2.x',
+    ...form.getHeaders(),
+  };
+  const res = await fetch(url, { method, headers, body: form });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
+  if (!res.ok) {
+    const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
+    throw new HttpError(res.status, msg, { path, data, status: res.status });
   }
+  return data;
 }
 
 // ---- Helpers ----
@@ -134,14 +134,10 @@ function toFieldDataShape(body) {
 function normalizeDraftArchive(fd, src) {
   const out = { ...fd };
   if (out._draft === undefined) {
-    if (src?.isDraft !== undefined) out._draft = !!src.isDraft;
-    else if (src?._draft !== undefined) out._draft = !!src._draft;
-    else out._draft = false;
+    out._draft = src?.isDraft !== undefined ? !!src.isDraft : (src?._draft !== undefined ? !!src._draft : false);
   }
   if (out._archived === undefined) {
-    if (src?.isArchived !== undefined) out._archived = !!src.isArchived;
-    else if (src?._archived !== undefined) out._archived = !!src._archived;
-    else out._archived = false;
+    out._archived = src?.isArchived !== undefined ? !!src.isArchived : (src?._archived !== undefined ? !!src._archived : false);
   }
   return out;
 }
@@ -150,32 +146,21 @@ async function listAllItems(collectionId, pageSize = 100) {
   const items = [];
   let offset = 0;
   while (true) {
-    const page = await wf('GET', `/collections/${collectionId}/items`, {
-      query: { offset, limit: pageSize }
-    });
-    const pageItems = Array.isArray(page?.items) ? page.items : (Array.isArray(page) ? page : []);
-    items.push(...pageItems);
-    if (pageItems.length < pageSize) break;
+    const page = await wf('GET', `/collections/${collectionId}/items`, { query: { offset, limit: pageSize } });
+    const arr = Array.isArray(page?.items) ? page.items : (Array.isArray(page) ? page : []);
+    items.push(...arr);
+    if (arr.length < pageSize) break;
     offset += pageSize;
   }
   return items;
 }
 
-// v2 site listing (only when full=true)
 async function listCollectionsForSite(siteId) {
-  try {
-    const resp = await wf('GET', `/sites/${siteId}/collections`);
-    const arr = Array.isArray(resp?.collections) ? resp.collections : (Array.isArray(resp) ? resp : []);
-    if (arr) return arr;
-  } catch (e) {
-    if (e.status && e.status !== 400) throw e;
-  }
-  const fb = await wf('GET', `/collections`, { query: { siteId } });
-  const arr = Array.isArray(fb?.collections) ? fb.collections : (Array.isArray(fb) ? fb : []);
-  return arr;
+  const resp = await wf('GET', `/sites/${siteId}/collections`);
+  return Array.isArray(resp?.collections) ? resp.collections : (Array.isArray(resp) ? resp : []);
 }
 
-// ---- Core Endpoints ----
+// ---- Endpoints (existing) ----
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -203,7 +188,7 @@ app.get('/sse', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
-// ---- Collections (SAFE by default) ----
+// Collections (SAFE by default; full=true uses site inventory)
 app.get('/collections', asyncHandler(async (req, res) => {
   const full = (req.query.full === 'true');
   if (full) {
@@ -213,26 +198,27 @@ app.get('/collections', asyncHandler(async (req, res) => {
     return res.json({ status: 'ok', mode: 'full', siteId, count: collections.length, collections });
   }
 
+  // Safe mode: just the env-mapped collections
   const ids = [ARTICLES_COLLECTION_ID, RESOURCES_COLLECTION_ID].filter(Boolean);
   const results = await Promise.all(ids.map(async (id) => {
     try {
       const c = await wf('GET', `/collections/${id}`);
       return { id, name: c?.name || c?.displayName || 'Unknown', slug: c?.slug, ok: true };
     } catch (e) {
-      return { id, name: 'Unknown (env)', ok: false, error: { status: e.status || 500, message: e.message } };
+      return { id, name: 'Unknown (env)', ok: false, error: { status: e.status || 500, message: e.message, details: e.details } };
     }
   }));
   res.json({ status: 'ok', mode: 'safe', count: results.length, collections: results });
 }));
 
-// Single collection metadata
+// One collection
 app.get('/collections/:idOrAlias', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const data = await wf('GET', `/collections/${collectionId}`);
   res.json({ status: 'ok', collection: data });
 }));
 
-// ---- Items LIST/GET ----
+// Items list
 app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { all, limit, offset } = req.query;
@@ -247,79 +233,54 @@ app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   res.json({ status: 'ok', collectionId, count: items.length, items });
 }));
 
+// Item get
 app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const item = await wf('GET', `/collections/${collectionId}/items/${req.params.itemId}`);
   res.json({ status: 'ok', collectionId, item });
 }));
 
-// ---- Items CREATE (with fieldData→fields fallback) ----
+// Item create (v2: fieldData with top-level isDraft/isArchived)
 app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const body = req.body || {};
   let fieldData = toFieldDataShape(body);
   fieldData = normalizeDraftArchive(fieldData, body);
-
-  try {
-    const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fieldData } });
-    return res.status(201).json({ status: 'ok', collectionId, created });
-  } catch (e) {
-    const msg = e?.details?.data?.msg || e.message || '';
-    const needFields = e.status === 400 && (/\'fields\' is required/i.test(msg) || /fields is required/i.test(msg));
-    if (!needFields) throw e;
-    const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fields: fieldData } });
-    return res.status(201).json({ status: 'ok', collectionId, created, note: 'v1 fields payload' });
-  }
+  const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived } });
+  res.status(201).json({ status: 'ok', collectionId, created });
 }));
 
-// ---- Items UPDATE (with fieldData→fields fallback) ----
+// Item update (v2: fieldData with top-level isDraft/isArchived)
 app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const itemId = req.params.itemId;
   const body = req.body || {};
   let fieldData = toFieldDataShape(body);
   fieldData = normalizeDraftArchive(fieldData, body);
-
-  try {
-    const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fieldData } });
-    return res.json({ status: 'ok', collectionId, itemId, updated });
-  } catch (e) {
-    const msg = e?.details?.data?.msg || e.message || '';
-    const needFields = e.status === 400 && (/\'fields\' is required/i.test(msg) || /fields is required/i.test(msg));
-    if (!needFields) throw e;
-    const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fields: fieldData } });
-    return res.json({ status: 'ok', collectionId, itemId, updated, note: 'v1 fields payload' });
-  }
+  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived } });
+  res.json({ status: 'ok', collectionId, itemId, updated });
 }));
 
-// ---- Items DELETE ----
+// Item delete
 app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const deleted = await wf('DELETE', `/collections/${collectionId}/items/${req.params.itemId}`);
   res.json({ status: 'ok', collectionId, itemId: req.params.itemId, deleted });
 }));
 
-// ---- Items PUBLISH ----
-app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
+// Publish (v2: fixed to /publish without /items)
+app.post('/collections/:idOrAlias/publish', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { itemIds = [], siteId } = req.body || {};
   const publishSiteId = siteId || WEBFLOW_SITE_ID;
   if (!Array.isArray(itemIds) || itemIds.length === 0) throw new HttpError(400, 'itemIds[] required');
-  try {
-    const published = await wf('POST', `/collections/${collectionId}/items/publish`, {
-      body: { itemIds, publishTo: publishSiteId ? [publishSiteId] : undefined }
-    });
-    return res.json({ status: 'ok', collectionId, published });
-  } catch (e) {
-    if (e.status && e.status !== 400) throw e;
-    const published = await wf('POST', `/collections/${collectionId}/items/publish`, {
-      body: { itemIds, live: true }
-    });
-    return res.json({ status: 'ok', collectionId, published, note: 'legacy publish fallback' });
-  }
+  const published = await wf('POST', `/collections/${collectionId}/publish`, {
+    body: { itemIds, publishTo: publishSiteId ? [publishSiteId] : undefined }
+  });
+  res.json({ status: 'ok', collectionId, published });
 }));
 
-// ---- Aliases ----
+// Aliases (adjusted for publish without /items)
 function aliasRoutes(alias, collectionId) {
   if (!collectionId) return;
   const forward = (method, path) =>
@@ -332,12 +293,12 @@ function aliasRoutes(alias, collectionId) {
   app.get(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
   app.patch(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
   app.delete(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
-  app.post(`/collections/${alias}/items/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.post(`/collections/${alias}/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
 }
 aliasRoutes('articles', ARTICLES_COLLECTION_ID);
 aliasRoutes('resources', RESOURCES_COLLECTION_ID);
 
-// ---- Audit (SAFE by default; full=true to use site) ----
+// Audit (env safe mode by default; full=true for site; fixed smoke publish path)
 app.get('/audit', asyncHandler(async (req, res) => {
   const full = (req.query.full === 'true');
   const siteId = req.query.siteId || WEBFLOW_SITE_ID;
@@ -377,7 +338,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
     let colError = null;
 
     try { items = await listAllItems(cid); }
-    catch (e) { colError = { status: e.status || 500, message: e.message }; }
+    catch (e) { colError = { status: e.status || 500, message: e.message, details: e.details }; }
 
     report.totals.items += items.length;
 
@@ -446,7 +407,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
     });
   }
 
-  // Smoke test (create → update → optional publish → delete)
+  // Smoke test (create → update → optional publish → delete; fixed publish path)
   if (doSmoke) {
     const smoke = { startedAt: new Date().toISOString() };
     const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
@@ -460,7 +421,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
       const name = `MCP Smoke Test ${ts}`;
 
       const created = await wf('POST', `/collections/${targetCid}/items`, {
-        body: { fieldData: { name, slug, _draft: true, _archived: false } }
+        body: { fieldData: { name, slug, _draft: true, _archived: false }, isDraft: true, isArchived: false }
       });
       const createdItemId =
         created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
@@ -468,19 +429,15 @@ app.get('/audit', asyncHandler(async (req, res) => {
       smoke.created = { ok: true, itemId: createdItemId };
 
       await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
-        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } }
+        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false }, isDraft: true, isArchived: false }
       });
       smoke.updated = { ok: true };
 
       if (publish) {
-        try {
-          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, {
-            body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
-          });
-          smoke.published = { ok: true, data: pub };
-        } catch (e) {
-          smoke.published = { ok: false, status: e.status || 500, message: e.message };
-        }
+        const pub = await wf('POST', `/collections/${targetCid}/publish`, {
+          body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
+        });
+        smoke.published = { ok: true, data: pub };
       }
 
       await wf('DELETE', `/collections/${targetCid}/items/${createdItemId}`);
@@ -498,6 +455,407 @@ app.get('/audit', asyncHandler(async (req, res) => {
   res.json(report);
 }));
 
+// ---- New: Token/Authorization ----
+app.get('/auth/user', asyncHandler(async (req, res) => {
+  const data = await wf('GET', '/token/authorized_by');
+  res.json({ status: 'ok', user: data });
+}));
+
+app.get('/auth/info', asyncHandler(async (req, res) => {
+  const data = await wf('GET', '/token/introspect');
+  res.json({ status: 'ok', info: data });
+}));
+
+// ---- New: Sites ----
+app.get('/sites', asyncHandler(async (req, res) => {
+  const data = await wf('GET', '/sites');
+  res.json({ status: 'ok', sites: data });
+}));
+
+app.get('/sites/:siteId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}`);
+  res.json({ status: 'ok', site: data });
+}));
+
+app.get('/sites/:siteId/domains', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/domains`);
+  res.json({ status: 'ok', domains: data });
+}));
+
+app.post('/sites/:siteId/publish', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/publish`, { body: req.body });
+  res.json({ status: 'ok', published: data });
+}));
+
+app.post('/sites', asyncHandler(async (req, res) => {
+  const data = await wf('POST', '/sites', { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.patch('/sites/:siteId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/sites/${req.params.siteId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/sites/:siteId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/sites/${req.params.siteId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+app.get('/sites/:siteId/plan', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/plan`);
+  res.json({ status: 'ok', plan: data });
+}));
+
+// ---- New: Pages and Components ----
+app.get('/sites/:siteId/pages', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/pages`);
+  res.json({ status: 'ok', pages: data });
+}));
+
+app.get('/pages/:pageId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/pages/${req.params.pageId}`);
+  res.json({ status: 'ok', page: data });
+}));
+
+app.put('/pages/:pageId', asyncHandler(async (req, res) => {
+  const data = await wf('PUT', `/pages/${req.params.pageId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.get('/pages/:pageId/content', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/pages/${req.params.pageId}/content`);
+  res.json({ status: 'ok', content: data });
+}));
+
+app.post('/pages/:pageId/content', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/pages/${req.params.pageId}/content`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.get('/sites/:siteId/components', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/components`);
+  res.json({ status: 'ok', components: data });
+}));
+
+app.get('/components/:componentId/content', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/components/${req.params.componentId}/content`);
+  res.json({ status: 'ok', content: data });
+}));
+
+app.post('/components/:componentId/content', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/components/${req.params.componentId}/content`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.get('/components/:componentId/properties', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/components/${req.params.componentId}/properties`);
+  res.json({ status: 'ok', properties: data });
+}));
+
+app.post('/components/:componentId/properties', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/components/${req.params.componentId}/properties`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+// ---- New: CMS Extensions (create/delete collections, fields) ----
+app.post('/sites/:siteId/collections', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/collections`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.delete('/collections/:collectionId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/collections/${req.params.collectionId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+app.post('/collections/:collectionId/fields', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/collections/${req.params.collectionId}/fields`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.patch('/collections/:collectionId/fields/:fieldId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/collections/${req.params.collectionId}/fields/${req.params.fieldId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/collections/:collectionId/fields/:fieldId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/collections/${req.params.collectionId}/fields/${req.params.fieldId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+// ---- New: Forms ----
+app.get('/sites/:siteId/forms', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/forms`);
+  res.json({ status: 'ok', forms: data });
+}));
+
+app.get('/forms/:formId/schema', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/forms/${req.params.formId}/schema`);
+  res.json({ status: 'ok', schema: data });
+}));
+
+app.get('/form-submissions', asyncHandler(async (req, res) => {
+  const data = await wf('GET', '/form-submissions', { query: req.query });
+  res.json({ status: 'ok', submissions: data });
+}));
+
+app.get('/form-submissions/:submissionId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/form-submissions/${req.params.submissionId}`);
+  res.json({ status: 'ok', submission: data });
+}));
+
+app.get('/sites/:siteId/form-submissions', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/form-submissions`, { query: req.query });
+  res.json({ status: 'ok', submissions: data });
+}));
+
+app.patch('/form-submissions/:submissionId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/form-submissions/${req.params.submissionId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/form-submissions/:submissionId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/form-submissions/${req.params.submissionId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+// ---- New: Custom Code ----
+app.get('/sites/:siteId/registered-scripts', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/registered_scripts`);
+  res.json({ status: 'ok', scripts: data });
+}));
+
+app.post('/sites/:siteId/registered-scripts/hosted', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/registered_scripts/hosted`, { body: req.body });
+  res.status(201).json({ status: 'ok', registered: data });
+}));
+
+app.post('/sites/:siteId/registered-scripts/inline', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/registered_scripts/inline`, { body: req.body });
+  res.status(201).json({ status: 'ok', registered: data });
+}));
+
+app.get('/sites/:siteId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/custom_code`);
+  res.json({ status: 'ok', customCode: data });
+}));
+
+app.put('/sites/:siteId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('PUT', `/sites/${req.params.siteId}/custom_code`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/sites/:siteId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/sites/${req.params.siteId}/custom_code`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+app.get('/pages/:pageId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/pages/${req.params.pageId}/custom_code`);
+  res.json({ status: 'ok', customCode: data });
+}));
+
+app.put('/pages/:pageId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('PUT', `/pages/${req.params.pageId}/custom_code`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/pages/:pageId/custom-code', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/pages/${req.params.pageId}/custom_code`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+// ---- New: Assets ----
+app.get('/sites/:siteId/assets', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/assets`, { query: req.query });
+  res.json({ status: 'ok', assets: data });
+}));
+
+app.get('/assets/:assetId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/assets/${req.params.assetId}`);
+  res.json({ status: 'ok', asset: data });
+}));
+
+app.post('/sites/:siteId/assets', asyncHandler(async (req, res) => {
+  // Assumes multipart form with file; adjust if needed
+  const form = new FormData();
+  // Example: form.append('file', req.files.file.data, req.files.file.name); (requires express-fileupload middleware)
+  // For simplicity, assume body has fields; extend for actual file upload
+  Object.entries(req.body).forEach(([k, v]) => form.append(k, v));
+  const data = await wfMultipart('POST', `/sites/${req.params.siteId}/assets`, form);
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.patch('/assets/:assetId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/assets/${req.params.assetId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/assets/:assetId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/assets/${req.params.assetId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+app.get('/sites/:siteId/asset-folders', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/asset_folders`);
+  res.json({ status: 'ok', folders: data });
+}));
+
+app.post('/sites/:siteId/asset-folders', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/asset_folders`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.get('/asset-folders/:folderId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/asset_folders/${req.params.folderId}`);
+  res.json({ status: 'ok', folder: data });
+}));
+
+// ---- New: Users ----
+app.get('/sites/:siteId/users', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/users`, { query: req.query });
+  res.json({ status: 'ok', users: data });
+}));
+
+app.get('/users/:userId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/users/${req.params.userId}`);
+  res.json({ status: 'ok', user: data });
+}));
+
+app.patch('/users/:userId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/users/${req.params.userId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.delete('/users/:userId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/users/${req.params.userId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+app.post('/sites/:siteId/users', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/users`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.get('/sites/:siteId/access-groups', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/access_groups`);
+  res.json({ status: 'ok', groups: data });
+}));
+
+// ---- New: Ecommerce ----
+app.get('/sites/:siteId/products', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/products`);
+  res.json({ status: 'ok', products: data });
+}));
+
+app.post('/sites/:siteId/products', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/products`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.get('/sites/:siteId/products/:productId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/products/${req.params.productId}`);
+  res.json({ status: 'ok', product: data });
+}));
+
+app.patch('/sites/:siteId/products/:productId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/sites/${req.params.siteId}/products/${req.params.productId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.post('/sites/:siteId/products/:productId/skus', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/products/${req.params.productId}/skus`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.patch('/sites/:siteId/skus/:skuId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/sites/${req.params.siteId}/skus/${req.params.skuId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.get('/sites/:siteId/orders', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/orders`, { query: req.query });
+  res.json({ status: 'ok', orders: data });
+}));
+
+app.get('/sites/:siteId/orders/:orderId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/orders/${req.params.orderId}`);
+  res.json({ status: 'ok', order: data });
+}));
+
+app.patch('/sites/:siteId/orders/:orderId', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/sites/${req.params.siteId}/orders/${req.params.orderId}`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.post('/sites/:siteId/orders/:orderId/fulfill', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/orders/${req.params.orderId}/fulfill`, { body: req.body });
+  res.json({ status: 'ok', fulfilled: data });
+}));
+
+app.post('/sites/:siteId/orders/:orderId/unfulfill', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/orders/${req.params.orderId}/unfulfill`, { body: req.body });
+  res.json({ status: 'ok', unfulfilled: data });
+}));
+
+app.post('/sites/:siteId/orders/:orderId/refund', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/orders/${req.params.orderId}/refund`, { body: req.body });
+  res.json({ status: 'ok', refunded: data });
+}));
+
+app.get('/collections/:collectionId/items/:itemId/inventory', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/collections/${req.params.collectionId}/items/${req.params.itemId}/inventory`);
+  res.json({ status: 'ok', inventory: data });
+}));
+
+app.patch('/collections/:collectionId/items/:itemId/inventory', asyncHandler(async (req, res) => {
+  const data = await wf('PATCH', `/collections/${req.params.collectionId}/items/${req.params.itemId}/inventory`, { body: req.body });
+  res.json({ status: 'ok', updated: data });
+}));
+
+app.get('/sites/:siteId/ecommerce/settings', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/ecommerce/settings`);
+  res.json({ status: 'ok', settings: data });
+}));
+
+// ---- New: Webhooks ----
+app.get('/sites/:siteId/webhooks', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/webhooks`);
+  res.json({ status: 'ok', webhooks: data });
+}));
+
+app.get('/webhooks/:webhookId', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/webhooks/${req.params.webhookId}`);
+  res.json({ status: 'ok', webhook: data });
+}));
+
+app.post('/sites/:siteId/webhooks', asyncHandler(async (req, res) => {
+  const data = await wf('POST', `/sites/${req.params.siteId}/webhooks`, { body: req.body });
+  res.status(201).json({ status: 'ok', created: data });
+}));
+
+app.delete('/webhooks/:webhookId', asyncHandler(async (req, res) => {
+  const data = await wf('DELETE', `/webhooks/${req.params.webhookId}`);
+  res.json({ status: 'ok', deleted: data });
+}));
+
+// ---- New: Enterprise/Logs ----
+app.get('/workspaces/:workspaceId/audit-logs', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/workspaces/${req.params.workspaceId}/audit_logs`, { query: req.query });
+  res.json({ status: 'ok', logs: data });
+}));
+
+app.get('/sites/:siteId/activity-logs', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/activity_logs`, { query: req.query });
+  res.json({ status: 'ok', logs: data });
+}));
+
+app.get('/sites/:siteId/configuration/redirects', asyncHandler(async (req, res) => {
+  const data = await wf('GET', `/sites/${req.params.siteId}/configuration/redirects`);
+  res.json({ status: 'ok', redirects: data });
+}));
+
 // ---- Not found ----
 app.use((req, res) => {
   res.status(404).json({ status: 'error', message: 'Not Found', details: { path: req.path } });
@@ -508,6 +866,7 @@ app.use((err, req, res, _next) => {
   const status = err instanceof HttpError ? err.status : (err.status || 500);
   const message = err.message || 'Internal Server Error';
   const details = (err instanceof HttpError) ? err.details : (err.details || undefined);
+  console.error(`[${SERVICE_NAME}] Error ${status} on ${req.method} ${req.path}: ${message}`, details ? JSON.stringify(details) : '');
   res.status(status).json({ status: 'error', message, details });
 });
 
