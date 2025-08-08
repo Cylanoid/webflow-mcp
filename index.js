@@ -25,10 +25,11 @@ function logRequest(route, req) {
 }
 
 /**
- * ✅ MCP-compliant SSE endpoint (Strict Spec)
+ * ✅ MCP-compliant SSE endpoint (Strict Spec + MCP flags)
  */
 app.get('/sse', (req, res) => {
   logRequest('SSE', req);
+  const startTime = Date.now();
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -37,8 +38,9 @@ app.get('/sse', (req, res) => {
     'Access-Control-Allow-Origin': '*'
   });
 
-  // Immediate handshake in strict SSE format
+  // Immediate handshake
   const handshake = {
+    mcp: true, // MCP flag
     type: "connection",
     status: "active",
     message: "Webflow MCP Connector is live",
@@ -49,19 +51,31 @@ app.get('/sse', (req, res) => {
   console.log(`📡 [SSE] Sent handshake: ${JSON.stringify(handshake)}`);
   res.write(`event: connection\n`);
   res.write(`data: ${JSON.stringify(handshake)}\n`);
-  res.write(`retry: 5000\n\n`);
+  res.write(`retry: 3000\n\n`);
 
-  // Heartbeat every 30 seconds
+  // Immediate "ready" confirmation event
+  const readyMsg = {
+    type: "status",
+    status: "ready",
+    message: "Connector is ready to accept MCP requests",
+    timestamp: new Date().toISOString()
+  };
+  res.write(`event: ready\n`);
+  res.write(`data: ${JSON.stringify(readyMsg)}\n\n`);
+  console.log(`✅ [SSE] Ready event sent`);
+
+  // Heartbeat every 10 seconds
   const interval = setInterval(() => {
     const hb = { type: "heartbeat", timestamp: new Date().toISOString() };
     res.write(`event: heartbeat\n`);
     res.write(`data: ${JSON.stringify(hb)}\n\n`);
     console.log(`💓 [SSE] Heartbeat sent at ${hb.timestamp}`);
-  }, 30000);
+  }, 10000);
 
   req.on('close', () => {
     clearInterval(interval);
-    console.log(`❌ [SSE] Connection closed from ${req.socket.remoteAddress} at ${new Date().toISOString()}`);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`❌ [SSE] Connection closed from ${req.socket.remoteAddress || 'unknown'} after ${elapsed}s at ${new Date().toISOString()}`);
     res.end();
   });
 });
