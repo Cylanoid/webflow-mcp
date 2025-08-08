@@ -1,376 +1,495 @@
-// index.js
+'use strict';
+
+/**
+ * Webflow MCP Connector
+ * - Hard-gated by CONNECTOR_API_TOKEN via x-api-token header (strict 401)
+ * - Defaults to WEBFLOW_SITE_ID
+ * - Collections convenience aliases for Articles/Resources via env IDs
+ * - Clean JSON errors
+ * - SSE heartbeat at /sse
+ * - Robust /health
+ * - CMS CRUD + publish
+ * - /audit to inventory, validate, suggest patches, and run a safe smoke test
+ *
+ * No secrets are logged. WEBFLOW_API_KEY must be provided only via env.
+ */
+
 const express = require('express');
-const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 
-// Secrets
-const WEBFLOW_API_KEY = process.env.WEBFLOW_API_KEY;
-const WEBFLOW_SITE_ID = process.env.WEBFLOW_SITE_ID;
+// ---- Env ----
+const {
+  PORT = 3000,
+  NODE_ENV = 'production',
+  WEBFLOW_API_KEY,
+  WEBFLOW_SITE_ID,
+  CONNECTOR_API_TOKEN,
+  ARTICLES_COLLECTION_ID,
+  RESOURCES_COLLECTION_ID,
+} = process.env;
 
-if (!WEBFLOW_API_KEY || !WEBFLOW_SITE_ID) {
-  console.error('❌ Missing WEBFLOW_API_KEY or WEBFLOW_SITE_ID');
-  process.exit(1);
+const SERVICE_NAME = 'webflow-mcp';
+const WF_API_BASE = 'https://api.webflow.com';
+const WF_ACCEPT_VERSION = '1.0.0'; // Keep broad compatibility
+
+// ---- Utilities ----
+class HttpError extends Error {
+  constructor(status, message, details) {
+    super(message || `HTTP ${status}`);
+    this.status = status || 500;
+    this.details = details;
+  }
 }
 
-app.use(cors());
-app.use(express.json());
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-// ---------- Helpers ----------
-function logRequest(route, req) {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  const ua = req.headers['user-agent'] || 'Unknown UA';
-  console.log(`📥 [${route}] from ${ip} | UA: ${ua} | ${new Date().toISOString()}`);
-}
+const safeCompare = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+};
 
-async function wfFetch(path, opts = {}) {
-  const url = `https://api.webflow.com/v2${path}`;
+// ---- Gate: strict 401 when CONNECTOR_API_TOKEN is set ----
+app.use((req, res, next) => {
+  const expected = CONNECTOR_API_TOKEN;
+  if (expected && !safeCompare(req.header('x-api-token') || '', expected)) {
+    return res
+      .status(401)
+      .json({ status: 'error', message: 'Unauthorized', details: { code: 'MISSING_OR_INVALID_API_TOKEN' } });
+  }
+  next();
+});
+
+// ---- Webflow HTTP client (uses built-in fetch in Node >=18) ----
+async function wf(method, path, { query, body } = {}) {
+  if (!WEBFLOW_API_KEY) {
+    throw new HttpError(500, 'WEBFLOW_API_KEY is not configured');
+  }
+  const url = new URL(WF_API_BASE + path);
+  if (query && typeof query === 'object') {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+    }
+  }
   const res = await fetch(url, {
-    ...opts,
+    method,
     headers: {
       'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
-      'accept-version': '1.0.0',
+      'accept-version': WF_ACCEPT_VERSION,
       'Content-Type': 'application/json',
-      ...(opts.headers || {})
-    }
+    },
+    body: body ? JSON.stringify(body) : undefined,
   });
-  const data = await res.json().catch(() => ({}));
+
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
   if (!res.ok) {
-    const msg = `Webflow API ${res.status}: ${JSON.stringify(data)}`;
-    throw new Error(msg);
+    const msg = (data && (data.err || data.message)) ? (data.err || data.message) : `Webflow API error ${res.status}`;
+    throw new HttpError(res.status, msg, { path, data });
   }
   return data;
 }
 
-// ---------- MCP — Streamable HTTP transport ----------
-// Spec: one endpoint that supports POST (JSON-RPC) and GET (SSE). :contentReference[oaicite:4]{index=4}
+const resolveCollectionId = (idOrAlias) => {
+  if (!idOrAlias) return null;
+  const low = String(idOrAlias).toLowerCase();
+  if (low === 'articles') return ARTICLES_COLLECTION_ID;
+  if (low === 'resources') return RESOURCES_COLLECTION_ID;
+  return idOrAlias; // assume raw ID
+};
 
-// In-memory noop “event stream” registry (simple demo)
-const sseClients = new Set();
+const getSlugFromItem = (item) => {
+  // Try multiple shapes to be resilient to API versions
+  return item?.slug ?? item?.fieldData?.slug ?? item?.fieldData?.['slug'] ?? undefined;
+};
 
-// GET /mcp -> optional server->client SSE stream (not strictly required for init)
-app.get('/mcp', (req, res) => {
-  logRequest('GET /mcp (SSE)', req);
+const getNameFromItem = (item) => {
+  return item?.name ?? item?.fieldData?.name ?? item?.fieldData?.['name'] ?? undefined;
+};
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
-
-  const start = Date.now();
-  const client = { res };
-  sseClients.add(client);
-
-  // harmless log + regular heartbeats
-  res.write(`event: log\n`);
-  res.write(`data: ${JSON.stringify({ message: 'SSE stream open', ts: new Date().toISOString() })}\n\n`);
-
-  const interval = setInterval(() => {
-    const hb = { type: 'heartbeat', timestamp: new Date().toISOString() };
-    res.write(`event: heartbeat\n`);
-    res.write(`data: ${JSON.stringify(hb)}\n\n`);
-  }, 10000);
-
-  req.on('close', () => {
-    clearInterval(interval);
-    sseClients.delete(client);
-    console.log(`❌ [/mcp SSE] closed after ${((Date.now()-start)/1000).toFixed(1)}s`);
-    res.end();
-  });
-});
-
-// POST /mcp -> JSON-RPC request(s). Must support initialize + tools. :contentReference[oaicite:5]{index=5}
-app.post('/mcp', async (req, res) => {
-  logRequest('POST /mcp', req);
-
-  // If body is an array and contains only notifications/responses -> 202 (spec)
-  // If it contains any requests -> we’ll return application/json (non-streaming) for simplicity. :contentReference[oaicite:6]{index=6}
-  const body = req.body;
-
-  // Normalize to array for uniform handling
-  const batch = Array.isArray(body) ? body : [body];
-
-  const responses = [];
-  for (const msg of batch) {
-    try {
-      if (!msg || typeof msg !== 'object') continue;
-
-      // Notifications: e.g., "notifications/initialized"
-      if (!('id' in msg) && typeof msg.method === 'string') {
-        console.log(`ℹ️ [MCP notif] ${msg.method}`);
-        continue;
-      }
-
-      // Only handle requests with id
-      if (msg && msg.id != null && typeof msg.method === 'string') {
-        const id = msg.id;
-        const method = msg.method;
-
-        // ---- initialize ----
-        if (method === 'initialize') {
-          // Return server capabilities and info (minimal, tools included). :contentReference[oaicite:7]{index=7}
-          responses.push({
-            jsonrpc: '2.0',
-            id,
-            result: {
-              protocolVersion: '2025-03-26',
-              capabilities: {
-                logging: {},
-                prompts: { listChanged: true },
-                resources: { subscribe: false, listChanged: true },
-                tools: { listChanged: true }
-              },
-              serverInfo: { name: 'Webflow MCP Connector', version: '1.0.0' },
-              instructions: 'Use tools to manage Webflow CMS (list collections, read items, create items, publish).'
-            }
-          });
-          continue;
-        }
-
-        // ---- tools/list ----
-        if (method === 'tools/list') {
-          responses.push({
-            jsonrpc: '2.0',
-            id,
-            result: {
-              tools: [
-                {
-                  name: 'wf_list_collections',
-                  description: 'List all CMS collections in the configured Webflow site.',
-                  inputSchema: { type: 'object', properties: {} }
-                },
-                {
-                  name: 'wf_get_items',
-                  description: 'List items from a specific collection.',
-                  inputSchema: {
-                    type: 'object',
-                    properties: {
-                      collectionId: { type: 'string', description: 'Webflow collection ID' },
-                      limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Optional limit' }
-                    },
-                    required: ['collectionId']
-                  }
-                },
-                {
-                  name: 'wf_create_item',
-                  description: 'Create a new item in a collection. Pass the fields payload exactly as Webflow expects.',
-                  inputSchema: {
-                    type: 'object',
-                    properties: {
-                      collectionId: { type: 'string', description: 'Webflow collection ID' },
-                      fields: { type: 'object', description: 'Item fields per Webflow schema' }
-                    },
-                    required: ['collectionId', 'fields']
-                  }
-                },
-                {
-                  name: 'wf_publish_site',
-                  description: 'Publish the entire site.',
-                  inputSchema: {
-                    type: 'object',
-                    properties: {
-                      publishToWebflow: { type: 'boolean', default: true }
-                    }
-                  }
-                }
-              ],
-              nextCursor: null
-            }
-          });
-          continue;
-        }
-
-        // ---- tools/call ----
-        if (method === 'tools/call') {
-          const { name, arguments: args = {} } = msg.params || {};
-          try {
-            if (name === 'wf_list_collections') {
-              const data = await wfFetch(`/sites/${WEBFLOW_SITE_ID}/collections`);
-              responses.push({
-                jsonrpc: '2.0',
-                id,
-                result: {
-                  content: [{ type: 'text', text: JSON.stringify(data) }],
-                  isError: false
-                }
-              });
-            } else if (name === 'wf_get_items') {
-              const { collectionId, limit } = args;
-              if (!collectionId) throw new Error('Missing collectionId');
-              const q = typeof limit === 'number' ? `?limit=${limit}` : '';
-              const data = await wfFetch(`/collections/${collectionId}/items${q}`);
-              responses.push({
-                jsonrpc: '2.0',
-                id,
-                result: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false }
-              });
-            } else if (name === 'wf_create_item') {
-              const { collectionId, fields } = args;
-              if (!collectionId || !fields) throw new Error('Missing collectionId or fields');
-              const data = await wfFetch(`/collections/${collectionId}/items`, {
-                method: 'POST',
-                body: JSON.stringify({ ...fields })
-              });
-              responses.push({
-                jsonrpc: '2.0',
-                id,
-                result: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false }
-              });
-            } else if (name === 'wf_publish_site') {
-              const { publishToWebflow = true } = args;
-              const data = await wfFetch(`/sites/${WEBFLOW_SITE_ID}/publish`, {
-                method: 'POST',
-                body: JSON.stringify({ publishToWebflow })
-              });
-              responses.push({
-                jsonrpc: '2.0',
-                id,
-                result: { content: [{ type: 'text', text: JSON.stringify(data) }], isError: false }
-              });
-            } else {
-              responses.push({
-                jsonrpc: '2.0',
-                id,
-                error: { code: -32602, message: `Unknown tool: ${name}` }
-              });
-            }
-          } catch (toolErr) {
-            responses.push({
-              jsonrpc: '2.0',
-              id,
-              result: {
-                content: [{ type: 'text', text: `Tool error: ${String(toolErr.message || toolErr)}` }],
-                isError: true
-              }
-            });
-          }
-          continue;
-        }
-
-        // Unknown method
-        responses.push({
-          jsonrpc: '2.0',
-          id,
-          error: { code: -32601, message: `Method not found: ${method}` }
-        });
-      }
-    } catch (err) {
-      console.error('❌ [MCP] handler error', err);
+function normalizeItemPayload(input) {
+  // Accepts either { fieldData: {...} } or flat keys (name, slug, etc.)
+  const source = input || {};
+  let fieldData = {};
+  if (source.fieldData && typeof source.fieldData === 'object') {
+    fieldData = { ...source.fieldData };
+  } else {
+    // copy all top-level fields as fieldData except known meta keys
+    const omit = new Set(['fieldData']);
+    for (const [k, v] of Object.entries(source)) {
+      if (!omit.has(k)) fieldData[k] = v;
     }
   }
 
-  // If no request in the batch (only notifications/responses), return 202
-  if (responses.length === 0) {
-    return res.status(202).end();
-  }
+  // Normalize draft/archived flags to Webflow v2 keys in fieldData
+  if (source._draft !== undefined) fieldData._draft = !!source._draft;
+  if (source._archived !== undefined) fieldData._archived = !!source._archived;
+  if (source.isDraft !== undefined) fieldData._draft = !!source.isDraft;
+  if (source.isArchived !== undefined) fieldData._archived = !!source.isArchived;
 
-  // For simplicity, always return application/json (client MUST support). :contentReference[oaicite:8]{index=8}
-  const payload = Array.isArray(body) ? responses : responses[0];
-  res.setHeader('Content-Type', 'application/json');
-  res.status(200).send(JSON.stringify(payload));
+  if (fieldData._draft === undefined) fieldData._draft = false;
+  if (fieldData._archived === undefined) fieldData._archived = false;
+
+  return { fieldData };
+}
+
+async function listAllItems(collectionId, pageSize = 100) {
+  const items = [];
+  let offset = 0;
+  while (true) {
+    const page = await wf('GET', `/collections/${collectionId}/items`, {
+      query: { offset, limit: pageSize }
+    });
+    const pageItems = Array.isArray(page?.items) ? page.items : (Array.isArray(page) ? page : []);
+    items.push(...pageItems);
+    if (pageItems.length < pageSize) break;
+    offset += pageSize;
+  }
+  return items;
+}
+
+// ---- Health ----
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    service: SERVICE_NAME,
+    env: NODE_ENV,
+    time: new Date().toISOString(),
+    defaults: {
+      siteIdPresent: Boolean(WEBFLOW_SITE_ID),
+      articlesCollectionPresent: Boolean(ARTICLES_COLLECTION_ID),
+      resourcesCollectionPresent: Boolean(RESOURCES_COLLECTION_ID),
+    }
+  });
 });
 
-// ---------- Legacy HTTP+SSE fallback endpoint ----------
-// When a client falls back, it does GET and expects the FIRST event to be "endpoint" telling where to POST. :contentReference[oaicite:9]{index=9}
+// ---- SSE heartbeat (MCP-style) ----
 app.get('/sse', (req, res) => {
-  logRequest('GET /sse (legacy)', req);
+  // Note: browser EventSource cannot set custom headers; this route is still gated by design.
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Connection', 'keep-alive');
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
-  });
-
-  // Required first event for legacy HTTP+SSE: tell client where to send JSON-RPC
-  res.write(`event: endpoint\n`);
-  res.write(`data: ${JSON.stringify({ endpoint: '/mcp' })}\n\n`);
-
-  // Optional: small status + heartbeat
-  const hello = {
-    type: 'connection',
-    status: 'active',
-    mcp: true,
-    message: 'Legacy SSE is active; POST your JSON-RPC to /mcp',
-    timestamp: new Date().toISOString()
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
-  res.write(`event: connection\n`);
-  res.write(`data: ${JSON.stringify(hello)}\n\n`);
 
+  send('hello', { service: SERVICE_NAME, time: new Date().toISOString() });
   const interval = setInterval(() => {
-    res.write(`event: heartbeat\n`);
-    res.write(`data: ${JSON.stringify({ type: 'heartbeat', ts: new Date().toISOString() })}\n\n`);
-  }, 10000);
+    send('heartbeat', { ts: Date.now() });
+  }, 25000);
 
   req.on('close', () => {
     clearInterval(interval);
-    res.end();
   });
 });
 
-// ---------- Your REST helpers (unchanged) ----------
-app.get('/collections', async (req, res) => {
-  logRequest('GET /collections', req);
-  try {
-    const data = await wfFetch(`/sites/${WEBFLOW_SITE_ID}/collections`);
-    res.json(data);
-  } catch (err) {
-    console.error('❌ [Collections] ', err);
-    res.status(500).json({ error: 'Failed to fetch collections' });
-  }
-});
+// ---- Optional Sites ----
+app.get('/sites', asyncHandler(async (req, res) => {
+  const data = await wf('GET', '/sites');
+  res.json({ status: 'ok', count: Array.isArray(data?.sites) ? data.sites.length : (Array.isArray(data) ? data.length : undefined), data });
+}));
 
-app.get('/collections/:id/items', async (req, res) => {
-  logRequest(`GET /collections/${req.params.id}/items`, req);
-  try {
-    const data = await wfFetch(`/collections/${req.params.id}/items`);
-    res.json(data);
-  } catch (err) {
-    console.error('❌ [Collection Items] ', err);
-    res.status(500).json({ error: 'Failed to fetch collection items' });
-  }
-});
+// ---- Collections (default site) ----
+app.get('/collections', asyncHandler(async (req, res) => {
+  const siteId = req.query.siteId || WEBFLOW_SITE_ID;
+  if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
+  const data = await wf('GET', `/sites/${siteId}/collections`);
+  const arr = Array.isArray(data?.collections) ? data.collections : (Array.isArray(data) ? data : []);
+  res.json({ status: 'ok', siteId, count: arr.length, collections: arr });
+}));
 
-app.post('/collections/:id/items', async (req, res) => {
-  logRequest(`POST /collections/${req.params.id}/items`, req);
+app.get('/collections/:idOrAlias', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const data = await wf('GET', `/collections/${collectionId}`);
+  res.json({ status: 'ok', collection: data });
+}));
+
+// ---- Items CRUD ----
+app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const { all, limit, offset } = req.query;
+
+  if (all === 'true') {
+    const items = await listAllItems(collectionId);
+    return res.json({ status: 'ok', collectionId, total: items.length, items });
+  }
+
+  const l = Math.min(Number(limit || 100), 100);
+  const o = Number(offset || 0);
+  const data = await wf('GET', `/collections/${collectionId}/items`, { query: { limit: l, offset: o } });
+  const items = Array.isArray(data?.items) ? data.items : (Array.isArray(data) ? data : []);
+  res.json({ status: 'ok', collectionId, count: items.length, items });
+}));
+
+app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const { itemId } = req.params;
+  const item = await wf('GET', `/collections/${collectionId}/items/${itemId}`);
+  res.json({ status: 'ok', collectionId, item });
+}));
+
+app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const payload = normalizeItemPayload(req.body || {});
+  const created = await wf('POST', `/collections/${collectionId}/items`, { body: payload });
+  res.status(201).json({ status: 'ok', collectionId, created });
+}));
+
+app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const { itemId } = req.params;
+  const payload = normalizeItemPayload(req.body || {});
+  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: payload });
+  res.json({ status: 'ok', collectionId, itemId, updated });
+}));
+
+app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const { itemId } = req.params;
+  const deleted = await wf('DELETE', `/collections/${collectionId}/items/${itemId}`);
+  res.json({ status: 'ok', collectionId, itemId, deleted });
+}));
+
+// ---- Publish items ----
+app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
+  const collectionId = resolveCollectionId(req.params.idOrAlias);
+  const { itemIds = [], siteId } = req.body || {};
+  const publishSiteId = siteId || WEBFLOW_SITE_ID;
+  if (!Array.isArray(itemIds) || itemIds.length === 0) throw new HttpError(400, 'itemIds[] required');
+
+  // Attempt v2 body with explicit site
+  let published;
   try {
-    const data = await wfFetch(`/collections/${req.params.id}/items`, {
-      method: 'POST',
-      body: JSON.stringify(req.body)
+    published = await wf('POST', `/collections/${collectionId}/items/publish`, {
+      body: { itemIds, publishTo: publishSiteId ? [publishSiteId] : undefined }
     });
-    res.json(data);
-  } catch (err) {
-    console.error('❌ [Create Item] ', err);
-    res.status(500).json({ error: 'Failed to create collection item' });
-  }
-});
-
-app.post('/publish', async (req, res) => {
-  logRequest('POST /publish', req);
-  try {
-    const data = await wfFetch(`/sites/${WEBFLOW_SITE_ID}/publish`, {
-      method: 'POST',
-      body: JSON.stringify({ publishToWebflow: true })
+  } catch (e) {
+    // Fallback to legacy live flag if needed
+    if (e.status && e.status !== 400) throw e;
+    published = await wf('POST', `/collections/${collectionId}/items/publish`, {
+      body: { itemIds, live: true }
     });
-    res.json(data);
-  } catch (err) {
-    console.error('❌ [Publish] ', err);
-    res.status(500).json({ error: 'Failed to publish site' });
   }
+  res.json({ status: 'ok', collectionId, published });
+}));
+
+// ---- Convenience aliases ----
+function aliasRoutes(alias, collectionId) {
+  if (!collectionId) return;
+  app.get(`/collections/${alias}/items`, (req, res, next) => {
+    req.params.idOrAlias = collectionId;
+    return app._router.handle(req, res, next);
+  });
+  app.post(`/collections/${alias}/items`, (req, res, next) => {
+    req.params.idOrAlias = collectionId;
+    return app._router.handle(req, res, next);
+  });
+  app.get(`/collections/${alias}`, (req, res, next) => {
+    req.params.idOrAlias = collectionId;
+    return app._router.handle(req, res, next);
+  });
+}
+aliasRoutes('articles', ARTICLES_COLLECTION_ID);
+aliasRoutes('resources', RESOURCES_COLLECTION_ID);
+
+// ---- Audit ----
+app.get('/audit', asyncHandler(async (req, res) => {
+  const siteId = req.query.siteId || WEBFLOW_SITE_ID;
+  const doSmoke = (req.query.doSmoke ?? 'true') === 'true';
+  const publish = (req.query.publish ?? 'false') === 'true'; // optional publish of smoke item
+  if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
+
+  // Inventory: collections for site
+  const colResp = await wf('GET', `/sites/${siteId}/collections`);
+  const collections = Array.isArray(colResp?.collections) ? colResp.collections :
+                      (Array.isArray(colResp) ? colResp : []);
+  const report = {
+    status: 'ok',
+    startedAt: new Date().toISOString(),
+    siteId,
+    totals: { collections: collections.length, items: 0 },
+    collections: [],
+    smokeTest: null
+  };
+
+  // Scan each collection
+  for (const c of collections) {
+    const cid = c.id || c._id || c.collectionId || c.databaseId || c;
+    const cname = c.displayName || c.name || c.slug || cid;
+    let items = [];
+    try {
+      items = await listAllItems(cid);
+    } catch (e) {
+      report.collections.push({
+        id: cid, name: cname, error: { status: e.status || 500, message: e.message }
+      });
+      continue;
+    }
+
+    report.totals.items += items.length;
+
+    const seenSlugs = new Map();
+    const missingSlugs = [];
+    const missingNames = [];
+    const drafts = [];
+    const archived = [];
+    const dupSlugs = []; // list of {slug, itemIds[]}
+
+    for (const it of items) {
+      const id = it.id || it._id || it.itemId || it['id'];
+      const slug = getSlugFromItem(it);
+      const name = getNameFromItem(it);
+      const isDraft = it?.isDraft ?? it?.fieldData?._draft ?? it?._draft ?? false;
+      const isArchived = it?.isArchived ?? it?.fieldData?._archived ?? it?._archived ?? false;
+
+      if (!slug) missingSlugs.push(id);
+      if (!name) missingNames.push(id);
+      if (isDraft) drafts.push(id);
+      if (isArchived) archived.push(id);
+
+      if (slug) {
+        if (!seenSlugs.has(slug)) seenSlugs.set(slug, []);
+        seenSlugs.get(slug).push(id);
+      }
+    }
+
+    for (const [slug, ids] of seenSlugs.entries()) {
+      if (ids.length > 1) dupSlugs.push({ slug, itemIds: ids });
+    }
+
+    // Suggestions: minimal, safe patch payloads for missing/dup slugs & missing names
+    const patchSuggestions = [];
+    const takeLast = (s, n) => String(s).slice(-n);
+
+    for (const it of items) {
+      const id = it.id || it._id || it.itemId || it['id'];
+      const slug = getSlugFromItem(it);
+      const name = getNameFromItem(it);
+
+      const changes = {};
+      let needsPatch = false;
+
+      if (!slug) {
+        changes.slug = `auto-${takeLast(id, 6)}`;
+        needsPatch = true;
+      } else if ((dupSlugs.find(d => d.itemIds.includes(id)))) {
+        changes.slug = `${slug}-${takeLast(id, 6)}`;
+        needsPatch = true;
+      }
+
+      if (!name) {
+        changes.name = `Missing name ${takeLast(id, 6)}`;
+        needsPatch = true;
+      }
+
+      if (needsPatch) {
+        patchSuggestions.push({
+          itemId: id,
+          changes,
+          patch: { fieldData: { ...changes, _draft: it?.fieldData?._draft ?? false, _archived: it?.fieldData?._archived ?? false } }
+        });
+      }
+    }
+
+    report.collections.push({
+      id: cid,
+      name: cname,
+      counts: {
+        items: items.length,
+        missingSlugs: missingSlugs.length,
+        missingNames: missingNames.length,
+        drafts: drafts.length,
+        archived: archived.length,
+        duplicateSlugGroups: dupSlugs.length
+      },
+      duplicateSlugs: dupSlugs,
+      patchSuggestions
+    });
+  }
+
+  // Smoke test (safe draft create→update→optional publish→delete) on Resources by default
+  if (doSmoke) {
+    const smoke = { startedAt: new Date().toISOString() };
+    const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
+    smoke.collectionId = targetCid;
+
+    try {
+      const ts = Date.now();
+      const slug = `mcp-smoke-${ts}`;
+      const name = `MCP Smoke Test ${ts}`;
+
+      // create (draft)
+      const created = await wf('POST', `/collections/${targetCid}/items`, {
+        body: { fieldData: { name, slug, _draft: true, _archived: false } }
+      });
+      const createdItemId =
+        created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
+
+      smoke.created = { ok: true, itemId: createdItemId };
+
+      // update
+      const updated = await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
+        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } }
+      });
+      smoke.updated = { ok: true };
+
+      // optional publish
+      if (publish) {
+        try {
+          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, {
+            body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
+          });
+          smoke.published = { ok: true, data: pub };
+        } catch (e) {
+          smoke.published = { ok: false, status: e.status || 500, message: e.message };
+        }
+      }
+
+      // delete
+      const del = await wf('DELETE', `/collections/${targetCid}/items/${createdItemId}`);
+      smoke.deleted = { ok: true, data: del };
+      smoke.ok = true;
+    } catch (e) {
+      smoke.ok = false;
+      smoke.error = { status: e.status || 500, message: e.message };
+    }
+
+    report.smokeTest = smoke;
+  }
+
+  report.finishedAt = new Date().toISOString();
+  res.json(report);
+}));
+
+// ---- Not found ----
+app.use((req, res) => {
+  res.status(404).json({ status: 'error', message: 'Not Found', details: { path: req.path } });
 });
 
-// Root
-app.get('/', (req, res) => {
-  logRequest('GET /', req);
-  res.json({ status: 'ok', message: 'Webflow MCP Connector running', endpoints: ['/mcp', '/sse'] });
+// ---- Error handler ----
+app.use((err, req, res, _next) => {
+  const status = err instanceof HttpError ? err.status : (err.status || 500);
+  const message = err.message || 'Internal Server Error';
+  const details = (err instanceof HttpError) ? err.details : (err.details || undefined);
+  res.status(status).json({ status: 'error', message, details });
 });
 
-// Start
-app.listen(PORT, () => {
-  console.log(`✅ Webflow MCP Connector running on port ${PORT}`);
-  console.log(`📡 MCP endpoint: POST/GET http://localhost:${PORT}/mcp`);
-  console.log(`📡 Legacy SSE (with endpoint hint): http://localhost:${PORT}/sse`);
-});
+// ---- Start ----
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`[${SERVICE_NAME}] listening on ${PORT}`);
+  });
+}
+
+module.exports = app;
