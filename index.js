@@ -36,6 +36,7 @@ const {
 const SERVICE_NAME = 'webflow-mcp';
 const WF_API_BASE = 'https://api.webflow.com';
 const WF_ACCEPT_VERSION = '1.1.0'; // v2-capable
+console.log(`[${SERVICE_NAME}] Using Webflow API version: ${WF_ACCEPT_VERSION}`);
 
 // ---- Utilities ----
 class HttpError extends Error {
