@@ -75,17 +75,26 @@ async function wf(method, path, { query, body } = {}) {
       if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
     }
   }
+
+  // Detect FormData; when present do NOT set Content-Type manually (boundary is auto-generated)
   const isForm = (typeof FormData !== 'undefined') && (body instanceof FormData);
+
   const headers = {
     'Authorization': `Bearer ${WEBFLOW_API_KEY}`,
     'User-Agent': 'webflow-mcp/2.x',
   };
   if (body && !isForm) headers['Content-Type'] = 'application/json';
-  if (isForm) Object.assign(headers, FormData.getHeaders ? FormData.getHeaders() : {}); // Fetch sets boundary
-  const res = await fetch(url, { method, headers, body: body ? (isForm ? body : JSON.stringify(body)) : undefined });
+
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? (isForm ? body : JSON.stringify(body)) : undefined
+  });
+
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
   if (!res.ok) {
     const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
     console.error(`[${SERVICE_NAME}] WF error: ${msg}`, { path, status: res.status });
@@ -240,7 +249,9 @@ app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const body = req.body || {};
   let fieldData = toFieldDataShape(body);
   fieldData = normalizeDraftArchive(fieldData, body);
-  const created = await wf('POST', `/collections/${collectionId}/items`, { body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived } });
+  const created = await wf('POST', `/collections/${collectionId}/items`, {
+    body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived }
+  });
   res.status(201).json({ status: 'ok', collectionId, created });
 }));
 
@@ -252,7 +263,9 @@ app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res)
   const body = req.body || {};
   let fieldData = toFieldDataShape(body);
   fieldData = normalizeDraftArchive(fieldData, body);
-  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived } });
+  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, {
+    body: { fieldData, isDraft: fieldData._draft, isArchived: fieldData._archived }
+  });
   res.json({ status: 'ok', collectionId, itemId, updated });
 }));
 
@@ -264,20 +277,20 @@ app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res
   res.json({ status: 'ok', collectionId, itemId: req.params.itemId, deleted });
 }));
 
-// Publish (v2)
-app.post('/collections/:idOrAlias/publish', asyncHandler(async (req, res) => {
+// Publish (v2) — correct path: /items/publish
+app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { itemIds = [], siteId } = req.body || {};
   const publishSiteId = siteId || WEBFLOW_SITE_ID;
   if (!Array.isArray(itemIds) || itemIds.length === 0) throw new HttpError(400, 'itemIds[] required');
-  const published = await wf('POST', `/collections/${collectionId}/publish`, {
+  const published = await wf('POST', `/collections/${collectionId}/items/publish`, {
     body: { itemIds, publishTo: publishSiteId ? [publishSiteId] : undefined }
   });
   res.json({ status: 'ok', collectionId, published });
 }));
 
-// Aliases
+// Aliases (restored)
 function aliasRoutes(alias, collectionId) {
   if (!collectionId) return;
   const forward = (method, path) =>
@@ -290,12 +303,12 @@ function aliasRoutes(alias, collectionId) {
   app.get(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
   app.patch(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
   app.delete(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
-  app.post(`/collections/${alias}/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.post(`/collections/${alias}/items/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
 }
 aliasRoutes('articles', ARTICLES_COLLECTION_ID);
 aliasRoutes('resources', RESOURCES_COLLECTION_ID);
 
-// Audit
+// Audit (env safe mode by default; full=true for site)
 app.get('/audit', asyncHandler(async (req, res) => {
   const full = (req.query.full === 'true');
   const siteId = req.query.siteId || WEBFLOW_SITE_ID;
@@ -406,6 +419,9 @@ app.get('/audit', asyncHandler(async (req, res) => {
 
   // Smoke test (create → update → optional publish → delete)
   if (doSmoke) {
+    // Require mutation approval for the smoke sequence
+    assertMutationAllowed(req);
+
     const smoke = { startedAt: new Date().toISOString() };
     const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
     smoke.collectionId = targetCid;
@@ -431,7 +447,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
       smoke.updated = { ok: true };
 
       if (publish) {
-        const pub = await wf('POST', `/collections/${targetCid}/publish`, {
+        const pub = await wf('POST', `/collections/${targetCid}/items/publish`, {
           body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
         });
         smoke.published = { ok: true, data: pub };
@@ -467,7 +483,7 @@ for (const base of PASSTHRU_BASES) {
   const handler = asyncHandler(async (req, res) => {
     assertMutationAllowed(req);
     const suffix = req.params[0] ? `/${req.params[0]}` : '';
-    const data = await wf(req.method, `/${base}${suffix}`, { query: req.query, body: req.body });
+    const data = await wf(req.method, `/${base}${suffix}`, { query: req.query, body: (req.body && Object.keys(req.body).length) ? req.body : undefined });
     res.json({ status: 'ok', base, data });
   });
   app.all(`/${base}`, handler);
@@ -480,10 +496,13 @@ app.post('/assets/upload-base64', asyncHandler(async (req, res) => {
   const { siteId = WEBFLOW_SITE_ID, folderId, fileName, fileBase64 } = req.body || {};
   if (!siteId) throw new HttpError(400, 'siteId required');
   if (!fileName || !fileBase64) throw new HttpError(400, 'fileName and fileBase64 required');
+
   const buf = Buffer.from(fileBase64, 'base64');
   const form = new FormData();
-  form.append('file', new Blob([buf]), fileName);
+  const blob = new Blob([buf]);
+  form.append('file', blob, fileName);
   if (folderId) form.append('folderId', folderId);
+
   const data = await wf('POST', `/sites/${siteId}/assets`, { body: form });
   res.status(201).json({ status: 'ok', asset: data });
 }));
@@ -517,7 +536,10 @@ app.use((err, req, res, _next) => {
   const status = err instanceof HttpError ? err.status : (err.status || 500);
   const message = err.message || 'Internal Server Error';
   const details = (err instanceof HttpError) ? err.details : (err.details || undefined);
-  console.error(`[${SERVICE_NAME}] Error ${status} on ${req.method} ${req.path}: ${message}`, details ? JSON.stringify(details) : '');
+  console.error(
+    `[${SERVICE_NAME}] Error ${status} on ${req.method} ${req.path}: ${message}`,
+    details ? JSON.stringify(details) : ''
+  );
   res.status(status).json({ status: 'error', message, details });
 });
 
