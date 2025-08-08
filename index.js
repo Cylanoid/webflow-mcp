@@ -31,7 +31,7 @@ const {
 
 const SERVICE_NAME = 'webflow-mcp';
 const WF_API_BASE = 'https://api.webflow.com';
-const WF_ACCEPT_VERSION = '1.0.0';
+const WF_ACCEPT_VERSION = '1.1.0';
 
 // ---- Utilities ----
 class HttpError extends Error {
