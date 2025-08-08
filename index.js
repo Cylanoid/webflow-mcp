@@ -5,7 +5,7 @@
  * - Auth gate via x-api-token (CONNECTOR_API_TOKEN)
  * - Health, SSE (/sse)
  * - Collections (safe mode by env; full=true for site inventory)
- * - Items CRUD (fieldData passed directly), publish (publishTo)
+ * - Items CRUD (fieldData passed directly with validation), publish (publishTo)
  * - Clean JSON errors
  * - No Accept-Version; base URL is /v2; Content-Type only when body exists
  * - Full Data API pass-through, form-data support, mutation guards, scope check
@@ -137,6 +137,16 @@ function assertMutationAllowed(req) {
   }
 }
 
+// ---- Validate CMS payload ----
+function validateCMSPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new HttpError(400, 'Payload must be a non-empty object');
+  }
+  if (!payload.fieldData || typeof payload.fieldData !== 'object') {
+    throw new HttpError(400, 'Payload must include fieldData object');
+  }
+}
+
 // ---- Endpoints (existing) ----
 app.get('/health', (req, res) => {
   res.json({
@@ -215,21 +225,23 @@ app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) =
   res.json({ status: 'ok', collectionId, item });
 }));
 
-// Item create (pass payload directly)
+// Item create (pass payload directly with validation)
 app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const payload = req.body || {};
+  validateCMSPayload(payload);
   const created = await wf('POST', `/collections/${collectionId}/items`, { body: payload });
   res.status(201).json({ status: 'ok', collectionId, created });
 }));
 
-// Item update (pass payload directly)
+// Item update (pass payload directly with validation)
 app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   assertMutationAllowed(req);
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const itemId = req.params.itemId;
   const payload = req.body || {};
+  validateCMSPayload(payload);
   const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: payload });
   res.json({ status: 'ok', collectionId, itemId, updated });
 }));
@@ -397,7 +409,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
       const name = `MCP Smoke Test ${ts}`;
 
       const created = await wf('POST', `/collections/${targetCid}/items`, {
-        body: { fieldData: { name, slug, _draft: true, _archived: false }, isDraft: true, isArchived: false }
+        body: { fieldData: { name, slug }, isDraft: true, isArchived: false }
       });
       const createdItemId =
         created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
@@ -405,7 +417,7 @@ app.get('/audit', asyncHandler(async (req, res) => {
       smoke.created = { ok: true, itemId: createdItemId };
 
       await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
-        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false }, isDraft: true, isArchived: false }
+        body: { fieldData: { name: `${name} (updated)`, slug }, isDraft: true, isArchived: false }
       });
       smoke.updated = { ok: true };
 
