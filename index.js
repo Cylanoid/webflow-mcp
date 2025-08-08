@@ -1,18 +1,14 @@
 'use strict';
 
 /**
- * Webflow MCP Connector
- * - Strict 401 via x-api-token if CONNECTOR_API_TOKEN is set
- * - Defaults to WEBFLOW_SITE_ID
- * - Aliases for Articles/Resources collections via env IDs
+ * Webflow MCP Connector – SAFE MODE by default
+ * - Auth gate: requires x-api-token if CONNECTOR_API_TOKEN is set
+ * - Health, SSE (/sse)
+ * - Collections & Audit:
+ *    * Default SAFE mode: use only env-mapped collections (no /sites calls)
+ *    * full=true: enable site-level inventory with v2 endpoints
+ * - Items CRUD, publish
  * - Clean JSON errors
- * - SSE heartbeat at /sse
- * - /health, /sites, /collections, item CRUD, publish
- * - /audit: inventory, checks, suggestions, safe smoke test
- *
- * Notes:
- * - Uses accept-version: 1.1.0 (v2 endpoints like /sites available)
- * - Collections fetch is resilient: tries /sites/{id}/collections, then /collections?siteId=...
  */
 
 const express = require('express');
@@ -51,7 +47,7 @@ const asyncHandler = (fn) => (req, res, next) =>
 
 const safeCompare = (a, b) => {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ab = Buffer.from(a); const bb = Buffer.from(b);
+  const ab = Buffer.from(a), bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return crypto.timingSafeEqual(ab, bb);
 };
@@ -69,7 +65,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Webflow HTTP client (Node >=18 has global fetch) ----
+// ---- Webflow HTTP client ----
 async function wf(method, path, { query, body } = {}) {
   if (!WEBFLOW_API_KEY) throw new HttpError(500, 'WEBFLOW_API_KEY is not configured');
 
@@ -95,9 +91,8 @@ async function wf(method, path, { query, body } = {}) {
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
   if (!res.ok) {
-    // Webflow often returns {msg, code, name, path, err}
     const msg = data?.err || data?.message || data?.msg || `Webflow API error ${res.status}`;
-    throw new HttpError(res.status, msg, { path, data });
+    throw new HttpError(res.status, msg, { path, data, status: res.status });
   }
   return data;
 }
@@ -110,12 +105,6 @@ const resolveCollectionId = (idOrAlias) => {
   if (low === 'resources') return RESOURCES_COLLECTION_ID;
   return idOrAlias;
 };
-
-const getSlugFromItem = (item) =>
-  item?.slug ?? item?.fieldData?.slug ?? item?.fieldData?.['slug'];
-
-const getNameFromItem = (item) =>
-  item?.name ?? item?.fieldData?.name ?? item?.fieldData?.['name'];
 
 function normalizeItemPayload(input) {
   const source = input || {};
@@ -151,25 +140,21 @@ async function listAllItems(collectionId, pageSize = 100) {
   return items;
 }
 
+// v2 site listing (used only when full=true)
 async function listCollectionsForSite(siteId) {
-  // Primary: v2 endpoint
   try {
     const resp = await wf('GET', `/sites/${siteId}/collections`);
     const arr = Array.isArray(resp?.collections) ? resp.collections : (Array.isArray(resp) ? resp : []);
-    if (arr && arr.length >= 0) return arr;
+    if (arr) return arr;
   } catch (e) {
-    // Fall through to fallback only on common 400s
     if (e.status && e.status !== 400) throw e;
   }
-  // Fallback: query param form
   const fb = await wf('GET', `/collections`, { query: { siteId } });
   const arr = Array.isArray(fb?.collections) ? fb.collections : (Array.isArray(fb) ? fb : []);
   return arr;
 }
 
-// ---- Endpoints ----
-
-// Health
+// ---- Core Endpoints ----
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -184,7 +169,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// SSE heartbeat
 app.get('/sse', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Content-Type', 'text/event-stream');
@@ -198,38 +182,45 @@ app.get('/sse', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
-// Sites (useful for debugging)
-app.get('/sites', asyncHandler(async (req, res) => {
-  const data = await wf('GET', '/sites');
-  const arr = Array.isArray(data?.sites) ? data.sites : (Array.isArray(data) ? data : []);
-  res.json({ status: 'ok', count: arr?.length, data });
-}));
-
-// Collections for default site
+// ---- Collections (SAFE by default) ----
 app.get('/collections', asyncHandler(async (req, res) => {
-  const siteId = req.query.siteId || WEBFLOW_SITE_ID;
-  if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
-  const collections = await listCollectionsForSite(siteId);
-  res.json({ status: 'ok', siteId, count: collections.length, collections });
+  const full = (req.query.full === 'true');
+  if (full) {
+    const siteId = req.query.siteId || WEBFLOW_SITE_ID;
+    if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
+    const collections = await listCollectionsForSite(siteId);
+    return res.json({ status: 'ok', mode: 'full', siteId, count: collections.length, collections });
+  }
+
+  // SAFE mode: env-only collections
+  const ids = [ARTICLES_COLLECTION_ID, RESOURCES_COLLECTION_ID].filter(Boolean);
+  // Try to fetch minimal metadata for each; if any call fails, still return the IDs
+  const results = await Promise.all(ids.map(async (id) => {
+    try {
+      const c = await wf('GET', `/collections/${id}`);
+      return { id, name: c?.name || c?.displayName || 'Unknown', slug: c?.slug, ok: true };
+    } catch {
+      return { id, name: 'Unknown (env)', ok: false };
+    }
+  }));
+  res.json({ status: 'ok', mode: 'safe', count: results.length, collections: results });
 }));
 
-// Collection metadata
+// Single collection metadata
 app.get('/collections/:idOrAlias', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const data = await wf('GET', `/collections/${collectionId}`);
   res.json({ status: 'ok', collection: data });
 }));
 
-// Items: list
+// Items
 app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { all, limit, offset } = req.query;
-
   if (all === 'true') {
     const items = await listAllItems(collectionId);
     return res.json({ status: 'ok', collectionId, total: items.length, items });
   }
-
   const l = Math.min(Number(limit || 100), 100);
   const o = Number(offset || 0);
   const data = await wf('GET', `/collections/${collectionId}/items`, { query: { limit: l, offset: o } });
@@ -237,15 +228,12 @@ app.get('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   res.json({ status: 'ok', collectionId, count: items.length, items });
 }));
 
-// Items: get one
 app.get('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const { itemId } = req.params;
-  const item = await wf('GET', `/collections/${collectionId}/items/${itemId}`);
+  const item = await wf('GET', `/collections/${collectionId}/items/${req.params.itemId}`);
   res.json({ status: 'ok', collectionId, item });
 }));
 
-// Items: create
 app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const payload = normalizeItemPayload(req.body || {});
@@ -253,31 +241,25 @@ app.post('/collections/:idOrAlias/items', asyncHandler(async (req, res) => {
   res.status(201).json({ status: 'ok', collectionId, created });
 }));
 
-// Items: update
 app.patch('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const { itemId } = req.params;
   const payload = normalizeItemPayload(req.body || {});
-  const updated = await wf('PATCH', `/collections/${collectionId}/items/${itemId}`, { body: payload });
-  res.json({ status: 'ok', collectionId, itemId, updated });
+  const updated = await wf('PATCH', `/collections/${collectionId}/items/${req.params.itemId}`, { body: payload });
+  res.json({ status: 'ok', collectionId, itemId: req.params.itemId, updated });
 }));
 
-// Items: delete
 app.delete('/collections/:idOrAlias/items/:itemId', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
-  const { itemId } = req.params;
-  const deleted = await wf('DELETE', `/collections/${collectionId}/items/${itemId}`);
-  res.json({ status: 'ok', collectionId, itemId, deleted });
+  const deleted = await wf('DELETE', `/collections/${collectionId}/items/${req.params.itemId}`);
+  res.json({ status: 'ok', collectionId, itemId: req.params.itemId, deleted });
 }));
 
-// Items: publish
+// Publish
 app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) => {
   const collectionId = resolveCollectionId(req.params.idOrAlias);
   const { itemIds = [], siteId } = req.body || {};
   const publishSiteId = siteId || WEBFLOW_SITE_ID;
   if (!Array.isArray(itemIds) || itemIds.length === 0) throw new HttpError(400, 'itemIds[] required');
-
-  // v2 style with publishTo; fallback to legacy 'live' if needed
   try {
     const published = await wf('POST', `/collections/${collectionId}/items/publish`, {
       body: { itemIds, publishTo: publishSiteId ? [publishSiteId] : undefined }
@@ -292,76 +274,63 @@ app.post('/collections/:idOrAlias/items/publish', asyncHandler(async (req, res) 
   }
 }));
 
-// Convenience aliases
+// Aliases
 function aliasRoutes(alias, collectionId) {
   if (!collectionId) return;
-  app.get(`/collections/${alias}`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.get(`/collections/${alias}/items`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.post(`/collections/${alias}/items`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.get(`/collections/${alias}/items/:itemId`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.patch(`/collections/${alias}/items/:itemId`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.delete(`/collections/${alias}/items/:itemId`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
-  app.post(`/collections/${alias}/items/publish`, (req, res, next) => {
-    req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
-  });
+  const forward = (method, path) =>
+    app[method](`/collections/${alias}${path}`, (req, res, next) => {
+      req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
+    });
+  forward('get', '');
+  forward('get', '/items');
+  app.post(`/collections/${alias}/items`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.get(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.patch(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.delete(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.post(`/collections/${alias}/items/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
 }
 aliasRoutes('articles', ARTICLES_COLLECTION_ID);
 aliasRoutes('resources', RESOURCES_COLLECTION_ID);
 
-// ---- /audit ----
+// ---- Audit (SAFE by default; full=true to use site) ----
 app.get('/audit', asyncHandler(async (req, res) => {
+  const full = (req.query.full === 'true');
   const siteId = req.query.siteId || WEBFLOW_SITE_ID;
   const doSmoke = (req.query.doSmoke ?? 'true') === 'true';
   const publish = (req.query.publish ?? 'false') === 'true';
 
-  if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
-
   const report = {
     status: 'ok',
+    mode: full ? 'full' : 'safe',
     startedAt: new Date().toISOString(),
-    siteId,
+    siteId: siteId || null,
     totals: { collections: 0, items: 0 },
     collections: [],
     smokeTest: null
   };
 
-  // Inventory: collections (resilient)
   let collections = [];
   try {
-    collections = await listCollectionsForSite(siteId);
+    if (full) {
+      if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
+      collections = await listCollectionsForSite(siteId);
+    } else {
+      collections = []
+        .concat(ARTICLES_COLLECTION_ID ? [{ id: ARTICLES_COLLECTION_ID, name: 'Articles (env)' }] : [])
+        .concat(RESOURCES_COLLECTION_ID ? [{ id: RESOURCES_COLLECTION_ID, name: 'Resources (env)' }] : []);
+    }
   } catch (e) {
-    // If both methods failed, still proceed with aliases if present
-    collections = []
-      .concat(ARTICLES_COLLECTION_ID ? [{ id: ARTICLES_COLLECTION_ID, name: 'Articles (alias)' }] : [])
-      .concat(RESOURCES_COLLECTION_ID ? [{ id: RESOURCES_COLLECTION_ID, name: 'Resources (alias)' }] : []);
-    report.collectionsFetchError = { status: e.status || 500, message: e.message, details: e.details };
+    report.collectionsFetchError = { status: e.status || 500, message: e.message };
   }
+
   report.totals.collections = collections.length;
 
-  // Scan each collection
   for (const c of collections) {
     const cid = c.id || c._id || c.collectionId || c;
     const cname = c.name || c.displayName || c.slug || cid;
     let items = [];
     let colError = null;
-
-    try {
-      items = await listAllItems(cid);
-    } catch (e) {
-      colError = { status: e.status || 500, message: e.message };
-    }
+    try { items = await listAllItems(cid); } catch (e) { colError = { status: e.status || 500, message: e.message }; }
 
     report.totals.items += items.length;
 
@@ -374,8 +343,8 @@ app.get('/audit', asyncHandler(async (req, res) => {
 
     for (const it of items) {
       const id = it.id || it._id || it.itemId || it['id'];
-      const slug = getSlugFromItem(it);
-      const name = getNameFromItem(it);
+      const slug = it?.slug ?? it?.fieldData?.slug;
+      const name = it?.name ?? it?.fieldData?.name;
       const isDraft = it?.isDraft ?? it?.fieldData?._draft ?? it?._draft ?? false;
       const isArchived = it?.isArchived ?? it?.fieldData?._archived ?? it?._archived ?? false;
 
@@ -389,27 +358,21 @@ app.get('/audit', asyncHandler(async (req, res) => {
         seenSlugs.get(slug).push(id);
       }
     }
-
     for (const [slug, ids] of seenSlugs.entries()) {
       if (ids.length > 1) dupSlugs.push({ slug, itemIds: ids });
     }
 
     const patchSuggestions = [];
     const takeLast = (s, n) => String(s).slice(-n);
-
     for (const it of items) {
       const id = it.id || it._id || it.itemId || it['id'];
-      const slug = getSlugFromItem(it);
-      const name = getNameFromItem(it);
+      const slug = it?.slug ?? it?.fieldData?.slug;
+      const name = it?.name ?? it?.fieldData?.name;
       const changes = {};
       let needs = false;
-
       if (!slug) { changes.slug = `auto-${takeLast(id, 6)}`; needs = true; }
-      else if (dupSlugs.find(d => d.itemIds.includes(id))) {
-        changes.slug = `${slug}-${takeLast(id, 6)}`; needs = true;
-      }
+      else if (dupSlugs.find(d => d.itemIds.includes(id))) { changes.slug = `${slug}-${takeLast(id, 6)}`; needs = true; }
       if (!name) { changes.name = `Missing name ${takeLast(id, 6)}`; needs = true; }
-
       if (needs) {
         patchSuggestions.push({
           itemId: id,
@@ -436,43 +399,28 @@ app.get('/audit', asyncHandler(async (req, res) => {
     });
   }
 
-  // Smoke test: create→update→(optional publish)→delete in Resources (or Articles fallback)
   if (doSmoke) {
     const smoke = { startedAt: new Date().toISOString() };
     const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
     smoke.collectionId = targetCid;
-
     try {
       if (!targetCid) throw new HttpError(400, 'No collection id available for smoke test');
-
       const ts = Date.now();
       const slug = `mcp-smoke-${ts}`;
       const name = `MCP Smoke Test ${ts}`;
-
-      const created = await wf('POST', `/collections/${targetCid}/items`, {
-        body: { fieldData: { name, slug, _draft: true, _archived: false } }
-      });
-      const createdItemId =
-        created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
-
+      const created = await wf('POST', `/collections/${targetCid}/items`, { body: { fieldData: { name, slug, _draft: true, _archived: false } } });
+      const createdItemId = created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
       smoke.created = { ok: true, itemId: createdItemId };
-
-      await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
-        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } }
-      });
+      await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, { body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false } } });
       smoke.updated = { ok: true };
-
       if (publish) {
         try {
-          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, {
-            body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
-          });
+          const pub = await wf('POST', `/collections/${targetCid}/items/publish`, { body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined } });
           smoke.published = { ok: true, data: pub };
         } catch (e) {
           smoke.published = { ok: false, status: e.status || 500, message: e.message };
         }
       }
-
       await wf('DELETE', `/collections/${targetCid}/items/${createdItemId}`);
       smoke.deleted = { ok: true };
       smoke.ok = true;
@@ -480,7 +428,6 @@ app.get('/audit', asyncHandler(async (req, res) => {
       smoke.ok = false;
       smoke.error = { status: e.status || 500, message: e.message, details: e.details };
     }
-
     report.smokeTest = smoke;
   }
 
@@ -507,5 +454,4 @@ if (require.main === module) {
     console.log(`[${SERVICE_NAME}] listening on ${PORT}`);
   });
 }
-
 module.exports = app;
