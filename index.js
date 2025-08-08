@@ -25,19 +25,19 @@ function logRequest(route, req) {
 }
 
 /**
- * ✅ MCP-compliant SSE endpoint
+ * ✅ MCP-compliant SSE endpoint (Strict Spec)
  */
 app.get('/sse', (req, res) => {
   logRequest('SSE', req);
 
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
+    'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*'
   });
 
-  // Immediate handshake
+  // Immediate handshake in strict SSE format
   const handshake = {
     type: "connection",
     status: "active",
@@ -47,11 +47,14 @@ app.get('/sse', (req, res) => {
   };
 
   console.log(`📡 [SSE] Sent handshake: ${JSON.stringify(handshake)}`);
-  res.write(`data: ${JSON.stringify(handshake)}\n\n`);
+  res.write(`event: connection\n`);
+  res.write(`data: ${JSON.stringify(handshake)}\n`);
+  res.write(`retry: 5000\n\n`);
 
   // Heartbeat every 30 seconds
   const interval = setInterval(() => {
     const hb = { type: "heartbeat", timestamp: new Date().toISOString() };
+    res.write(`event: heartbeat\n`);
     res.write(`data: ${JSON.stringify(hb)}\n\n`);
     console.log(`💓 [SSE] Heartbeat sent at ${hb.timestamp}`);
   }, 30000);
