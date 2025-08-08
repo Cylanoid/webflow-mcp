@@ -81,7 +81,7 @@ async function wf(method, path, { query, body } = {}) {
     'User-Agent': 'webflow-mcp/2.x',
   };
   if (body && !isForm) headers['Content-Type'] = 'application/json';
-  if (isForm) headers['Content-Type'] = 'multipart/form-data'; // Fetch sets boundary
+  if (isForm) Object.assign(headers, FormData.getHeaders ? FormData.getHeaders() : {}); // Fetch sets boundary
   const res = await fetch(url, { method, headers, body: body ? (isForm ? body : JSON.stringify(body)) : undefined });
   const text = await res.text();
   let data = null;
@@ -278,12 +278,178 @@ app.post('/collections/:idOrAlias/publish', asyncHandler(async (req, res) => {
 }));
 
 // Aliases
+function aliasRoutes(alias, collectionId) {
+  if (!collectionId) return;
+  const forward = (method, path) =>
+    app[method](`/collections/${alias}${path}`, (req, res, next) => {
+      req.params.idOrAlias = collectionId; app._router.handle(req, res, next);
+    });
+  forward('get', '');
+  forward('get', '/items');
+  app.post(`/collections/${alias}/items`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.get(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.patch(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.delete(`/collections/${alias}/items/:itemId`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+  app.post(`/collections/${alias}/publish`, (req, res, next) => { req.params.idOrAlias = collectionId; app._router.handle(req, res, next); });
+}
 aliasRoutes('articles', ARTICLES_COLLECTION_ID);
 aliasRoutes('resources', RESOURCES_COLLECTION_ID);
 
-// Audit (existing, with guard on smoke mutations)
+// Audit
 app.get('/audit', asyncHandler(async (req, res) => {
-  // ... (your existing audit code here, unchanged; smoke test will call assertMutationAllowed implicitly via wf)
+  const full = (req.query.full === 'true');
+  const siteId = req.query.siteId || WEBFLOW_SITE_ID;
+  const doSmoke = (req.query.doSmoke ?? 'true') === 'true';
+  const publish = (req.query.publish ?? 'false') === 'true';
+
+  const report = {
+    status: 'ok',
+    mode: full ? 'full' : 'safe',
+    startedAt: new Date().toISOString(),
+    siteId: siteId || null,
+    totals: { collections: 0, items: 0 },
+    collections: [],
+    smokeTest: null
+  };
+
+  let collections = [];
+  try {
+    if (full) {
+      if (!siteId) throw new HttpError(400, 'Missing siteId (and WEBFLOW_SITE_ID not set)');
+      collections = await listCollectionsForSite(siteId);
+    } else {
+      collections = []
+        .concat(ARTICLES_COLLECTION_ID ? [{ id: ARTICLES_COLLECTION_ID, name: 'Articles (env)' }] : [])
+        .concat(RESOURCES_COLLECTION_ID ? [{ id: RESOURCES_COLLECTION_ID, name: 'Resources (env)' }] : []);
+    }
+  } catch (e) {
+    report.collectionsFetchError = { status: e.status || 500, message: e.message, details: e.details };
+  }
+
+  report.totals.collections = collections.length;
+
+  for (const c of collections) {
+    const cid = c.id || c._id || c.collectionId || c;
+    const cname = c.name || c.displayName || c.slug || cid;
+    let items = [];
+    let colError = null;
+
+    try { items = await listAllItems(cid); }
+    catch (e) { colError = { status: e.status || 500, message: e.message, details: e.details }; }
+
+    report.totals.items += items.length;
+
+    const seenSlugs = new Map();
+    const missingSlugs = [];
+    const missingNames = [];
+    const drafts = [];
+    const archived = [];
+    const dupSlugs = [];
+
+    for (const it of items) {
+      const id = it.id || it._id || it.itemId || it['id'];
+      const slug = it?.slug ?? it?.fieldData?.slug;
+      const name = it?.name ?? it?.fieldData?.name;
+      const isDraft = it?.isDraft ?? it?.fieldData?._draft ?? it?._draft ?? false;
+      const isArchived = it?.isArchived ?? it?.fieldData?._archived ?? it?._archived ?? false;
+
+      if (!slug) missingSlugs.push(id);
+      if (!name) missingNames.push(id);
+      if (isDraft) drafts.push(id);
+      if (isArchived) archived.push(id);
+
+      if (slug) {
+        if (!seenSlugs.has(slug)) seenSlugs.set(slug, []);
+        seenSlugs.get(slug).push(id);
+      }
+    }
+    for (const [slug, ids] of seenSlugs.entries()) {
+      if (ids.length > 1) dupSlugs.push({ slug, itemIds: ids });
+    }
+
+    const patchSuggestions = [];
+    const takeLast = (s, n) => String(s).slice(-n);
+    for (const it of items) {
+      const id = it.id || it._id || it.itemId || it['id'];
+      const slug = it?.slug ?? it?.fieldData?.slug;
+      const name = it?.name ?? it?.fieldData?.name;
+      const changes = {};
+      let needs = false;
+      if (!slug) { changes.slug = `auto-${takeLast(id, 6)}`; needs = true; }
+      else if (dupSlugs.find(d => d.itemIds.includes(id))) { changes.slug = `${slug}-${takeLast(id, 6)}`; needs = true; }
+      if (!name) { changes.name = `Missing name ${takeLast(id, 6)}`; needs = true; }
+      if (needs) {
+        patchSuggestions.push({
+          itemId: id,
+          changes,
+          patch: { fieldData: { ...changes, _draft: it?.fieldData?._draft ?? false, _archived: it?.fieldData?._archived ?? false } }
+        });
+      }
+    }
+
+    report.collections.push({
+      id: cid,
+      name: cname,
+      error: colError,
+      counts: {
+        items: items.length,
+        missingSlugs: missingSlugs.length,
+        missingNames: missingNames.length,
+        drafts: drafts.length,
+        archived: archived.length,
+        duplicateSlugGroups: dupSlugs.length
+      },
+      duplicateSlugs: dupSlugs,
+      patchSuggestions
+    });
+  }
+
+  // Smoke test (create → update → optional publish → delete)
+  if (doSmoke) {
+    const smoke = { startedAt: new Date().toISOString() };
+    const targetCid = RESOURCES_COLLECTION_ID || ARTICLES_COLLECTION_ID || (report.collections[0]?.id);
+    smoke.collectionId = targetCid;
+
+    try {
+      if (!targetCid) throw new HttpError(400, 'No collection id available for smoke test');
+
+      const ts = Date.now();
+      const slug = `mcp-smoke-${ts}`;
+      const name = `MCP Smoke Test ${ts}`;
+
+      const created = await wf('POST', `/collections/${targetCid}/items`, {
+        body: { fieldData: { name, slug, _draft: true, _archived: false }, isDraft: true, isArchived: false }
+      });
+      const createdItemId =
+        created?.id || created?._id || created?.item?._id || created?.item?.id || created?.itemId;
+
+      smoke.created = { ok: true, itemId: createdItemId };
+
+      await wf('PATCH', `/collections/${targetCid}/items/${createdItemId}`, {
+        body: { fieldData: { name: `${name} (updated)`, _draft: true, _archived: false }, isDraft: true, isArchived: false }
+      });
+      smoke.updated = { ok: true };
+
+      if (publish) {
+        const pub = await wf('POST', `/collections/${targetCid}/publish`, {
+          body: { itemIds: [createdItemId], publishTo: WEBFLOW_SITE_ID ? [WEBFLOW_SITE_ID] : undefined }
+        });
+        smoke.published = { ok: true, data: pub };
+      }
+
+      await wf('DELETE', `/collections/${targetCid}/items/${createdItemId}`);
+      smoke.deleted = { ok: true };
+      smoke.ok = true;
+    } catch (e) {
+      smoke.ok = false;
+      smoke.error = { status: e.status || 500, message: e.message, details: e.details };
+    }
+
+    report.smokeTest = smoke;
+  }
+
+  report.finishedAt = new Date().toISOString();
+  res.json(report);
 }));
 
 // ---- New: Generic pass-through for Webflow Data API (allow-listed bases) ----
